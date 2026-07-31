@@ -33,6 +33,40 @@ export function registerDashboardRoutes(app, { pool, wrap, requireAuth }) {
   );
 
   app.get(
+    "/api/dashboard/reject/top-comparison",
+    requireAuth,
+    wrap(async (req, res) => {
+      try {
+        const data = await dashboard.getTopComparison(req.query);
+        res.json(data);
+      } catch (err) {
+        if (err.status === 400) {
+          res.status(400).json({ message: err.message });
+          return;
+        }
+        throw err;
+      }
+    }),
+  );
+
+  app.get(
+    "/api/dashboard/reject/machine-comparison",
+    requireAuth,
+    wrap(async (req, res) => {
+      try {
+        const data = await dashboard.getMachineComparison(req.query);
+        res.json(data);
+      } catch (err) {
+        if (err.status === 400) {
+          res.status(400).json({ message: err.message });
+          return;
+        }
+        throw err;
+      }
+    }),
+  );
+
+  app.get(
     "/api/dashboard/reject/kpi-detail",
     requireAuth,
     wrap(async (req, res) => {

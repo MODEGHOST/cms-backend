@@ -32,6 +32,9 @@ export function createMasterService(pool) {
       if (!String(body?.name || "").trim()) throw httpError(400, "name is required");
       try {
         const id = await repo.createSimple(key, body);
+        if (key === "companies" && body?.aliases != null) {
+          await repo.ensureAliases(id, body.aliases);
+        }
         return repo.findById(key, id);
       } catch (err) {
         if (err?.code === "ER_DUP_ENTRY") throw httpError(409, "Name already exists");
@@ -58,6 +61,9 @@ export function createMasterService(pool) {
       try {
         const ok = await repo.updateSimple(key, numericId, body);
         if (!ok) throw httpError(404, "Not found");
+        if (key === "companies" && body?.aliases != null) {
+          await repo.ensureAliases(numericId, body.aliases);
+        }
         return repo.findById(key, numericId);
       } catch (err) {
         if (err?.status) throw err;

@@ -1,3 +1,13 @@
+/** Column that absorbs rejects with no machine, or a machine removed from Master. */
+const MACHINE_OTHER_KEY = "machine_other";
+
+/** How many buckets the machine comparison table may show, per grain. */
+const MACHINE_COMPARISON_BUCKETS = {
+  day: { options: [7, 14, 30], default: 7 },
+  week: { options: [4, 8, 12], default: 4 },
+  month: { options: [3, 6, 12], default: 6 },
+};
+
 /**
  * Dashboard aggregations — all filtering happens in SQL on the backend.
  */
@@ -42,15 +52,15 @@ export function createDashboardService(pool) {
     }
 
     if (period === "week") {
-      const monday = new Date(today);
-      const offset = (today.getDay() + 6) % 7;
-      monday.setDate(today.getDate() - offset);
-      const sunday = new Date(monday);
-      sunday.setDate(monday.getDate() + 6);
+      // Sunday–Saturday week (company convention)
+      const sunday = new Date(today);
+      sunday.setDate(today.getDate() - today.getDay());
+      const saturday = new Date(sunday);
+      saturday.setDate(sunday.getDate() + 6);
       return {
         period: "week",
-        from: toIsoDate(monday),
-        to: toIsoDate(sunday),
+        from: toIsoDate(sunday),
+        to: toIsoDate(saturday),
       };
     }
 
@@ -83,10 +93,87 @@ export function createDashboardService(pool) {
       return `DATE_FORMAT(rr.reject_received_date, '%Y-%m-01')`;
     }
     if (grain === "week") {
-      // Monday-start week (MySQL WEEKDAY: Mon=0 … Sun=6)
-      return `DATE_SUB(rr.reject_received_date, INTERVAL WEEKDAY(rr.reject_received_date) DAY)`;
+      // Sunday–Saturday week (MySQL DAYOFWEEK: Sun=1 … Sat=7)
+      return `DATE_SUB(rr.reject_received_date, INTERVAL DAYOFWEEK(rr.reject_received_date) - 1 DAY)`;
     }
     return `rr.reject_received_date`;
+  }
+
+  function comparisonGrain(query, range) {
+    const requested = String(query.grain || "").toLowerCase();
+    if (["day", "week", "month"].includes(requested)) return requested;
+    if (["day", "week", "month"].includes(range.period)) return range.period;
+    if (range.period === "all") return "month";
+    return resolveTrendGrain(range);
+  }
+
+  function comparisonPeriodStart(value, grain) {
+    const date = new Date(`${String(value).slice(0, 10)}T12:00:00`);
+    if (Number.isNaN(date.getTime())) return null;
+    if (grain === "week") {
+      // Snap to Sunday (getDay: Sun=0 … Sat=6)
+      date.setDate(date.getDate() - date.getDay());
+    } else if (grain === "month") {
+      date.setDate(1);
+    }
+    return date;
+  }
+
+  function shiftComparisonPeriod(value, grain, amount) {
+    const date = new Date(value);
+    if (grain === "month") {
+      date.setMonth(date.getMonth() + amount, 1);
+    } else {
+      date.setDate(date.getDate() + amount * (grain === "week" ? 7 : 1));
+    }
+    return date;
+  }
+
+  function comparisonPeriodEnd(start, grain) {
+    const end = shiftComparisonPeriod(start, grain, 1);
+    end.setDate(end.getDate() - 1);
+    return end;
+  }
+
+  function comparisonPeriodLabel(from, to, grain) {
+    if (grain === "month") return from.slice(0, 7);
+    if (grain === "week") return `${from} – ${to}`;
+    return from;
+  }
+
+  function buildComparisonPeriods(range, grain, previousPeriods) {
+    const currentStart = comparisonPeriodStart(range.to, grain);
+    if (!currentStart) return [];
+
+    return Array.from({ length: previousPeriods + 1 }, (_, index) => {
+      const offset = index - previousPeriods;
+      const start = shiftComparisonPeriod(currentStart, grain, offset);
+      const end = comparisonPeriodEnd(start, grain);
+      const from = toIsoDate(start);
+      const to = toIsoDate(end);
+      return {
+        key: `period_${index}`,
+        label: comparisonPeriodLabel(from, to, grain),
+        from,
+        to,
+        current: index === previousPeriods,
+      };
+    });
+  }
+
+  function resolveMachineComparisonBuckets(value, grain) {
+    const config = MACHINE_COMPARISON_BUCKETS[grain] || MACHINE_COMPARISON_BUCKETS.day;
+    const requested = Number(value);
+    return {
+      count: config.options.includes(requested) ? requested : config.default,
+      options: config.options,
+    };
+  }
+
+  /** "all" resolves to a far-future end date — never anchor comparison buckets there. */
+  function anchorNotInFuture(range) {
+    const today = toIsoDate(new Date());
+    return { ...range, to: range.to && range.to < today ? range.to : today };
   }
 
   function parseIdList(value) {
@@ -651,6 +738,284 @@ export function createDashboardService(pool) {
       };
     },
 
+    async getTopComparison(query = {}) {
+      const type = String(query.type || "").toLowerCase();
+      if (!["problems", "companies"].includes(type)) {
+        const err = new Error("type ต้องเป็น problems หรือ companies");
+        err.status = 400;
+        throw err;
+      }
+
+      const requestedPeriods = Number(query.previous_periods || 3);
+      if (![3, 5].includes(requestedPeriods)) {
+        const err = new Error("previous_periods ต้องเป็น 3 หรือ 5");
+        err.status = 400;
+        throw err;
+      }
+
+      const range = resolveDateRange(query);
+      const grain = comparisonGrain(query, range);
+      const periods = buildComparisonPeriods(range, grain, requestedPeriods);
+      if (!periods.length) {
+        const err = new Error("ไม่สามารถคำนวณช่วงเวลาเปรียบเทียบได้");
+        err.status = 400;
+        throw err;
+      }
+
+      const filterIds = resolveFilterIds(query);
+      const currentFilter = buildWhere({ ...range, ...filterIds });
+      const isProblems = type === "problems";
+      const entityTable = isProblems ? "problems" : "companies";
+      const entityAlias = isProblems ? "p" : "c";
+      const entityForeignKey = isProblems ? "problem_id" : "company_id";
+      const amountSelect = isProblems
+        ? ""
+        : `, COALESCE(SUM(
+             CASE
+               WHEN rr.claim_sheet_qty IS NULL OR rr.price_per_sheet IS NULL THEN 0
+               ELSE rr.claim_sheet_qty * rr.price_per_sheet
+             END
+           ), 0) AS reject_amount`;
+
+      const [currentTop] = await pool.query(
+        `SELECT ${entityAlias}.id, ${entityAlias}.name, COUNT(*) AS count${amountSelect}
+         FROM reject_records rr
+         INNER JOIN ${entityTable} ${entityAlias}
+           ON ${entityAlias}.id = rr.${entityForeignKey}
+         ${currentFilter.whereSql}
+         GROUP BY ${entityAlias}.id, ${entityAlias}.name
+         ORDER BY count DESC, ${entityAlias}.name ASC
+         LIMIT 5`,
+        currentFilter.params,
+      );
+
+      if (!currentTop.length) {
+        return {
+          type,
+          grain,
+          previous_periods: requestedPeriods,
+          periods,
+          items: [],
+        };
+      }
+
+      const entityIds = currentTop.map((row) => Number(row.id));
+      const combinedRange = {
+        from: periods[0].from,
+        to: periods[periods.length - 1].to,
+      };
+      const combinedFilter = buildWhere({ ...combinedRange, ...filterIds });
+      const bucketExpr = trendBucketSql(grain);
+      const [rows] = await pool.query(
+        `SELECT
+           ${bucketExpr} AS period_start,
+           ${entityAlias}.id,
+           ${entityAlias}.name,
+           COUNT(*) AS count${amountSelect}
+         FROM reject_records rr
+         INNER JOIN ${entityTable} ${entityAlias}
+           ON ${entityAlias}.id = rr.${entityForeignKey}
+         ${combinedFilter.whereSql}
+           AND ${entityAlias}.id IN (${entityIds.map(() => "?").join(", ")})
+         GROUP BY ${bucketExpr}, ${entityAlias}.id, ${entityAlias}.name
+         ORDER BY period_start ASC, count DESC`,
+        [...combinedFilter.params, ...entityIds],
+      );
+
+      const periodByStart = new Map(periods.map((item) => [item.from, item]));
+      const valuesByEntity = new Map(
+        currentTop.map((item) => [
+          Number(item.id),
+          new Map(periods.map((period) => [
+            period.key,
+            { period_key: period.key, count: 0, reject_amount: 0 },
+          ])),
+        ]),
+      );
+
+      for (const row of rows) {
+        const period = periodByStart.get(normalizeDate(row.period_start));
+        const entityValues = valuesByEntity.get(Number(row.id));
+        if (!period || !entityValues) continue;
+        entityValues.set(period.key, {
+          period_key: period.key,
+          count: Number(row.count || 0),
+          reject_amount: Number(row.reject_amount || 0),
+        });
+      }
+
+      return {
+        type,
+        grain,
+        previous_periods: requestedPeriods,
+        periods,
+        items: currentTop.map((item) => {
+          const values = [...valuesByEntity.get(Number(item.id)).values()];
+          return {
+            id: Number(item.id),
+            name: item.name,
+            current_count: Number(item.count || 0),
+            current_reject_amount: Number(item.reject_amount || 0),
+            total_count: values.reduce((sum, value) => sum + value.count, 0),
+            total_reject_amount: values.reduce((sum, value) => sum + value.reject_amount, 0),
+            values,
+          };
+        }),
+      };
+    },
+
+    /**
+     * Machine comparison matrix — one row per time bucket, one column group per
+     * machine (BHS / YUELI / ISOWA / …) holding sheets, value and weight.
+     */
+    async getMachineComparison(query = {}) {
+      const range = resolveDateRange(query);
+      const grain = comparisonGrain(query, range);
+      const buckets = resolveMachineComparisonBuckets(query.periods, grain);
+      const periods = buildComparisonPeriods(anchorNotInFuture(range), grain, buckets.count - 1);
+      if (!periods.length) {
+        const err = new Error("ไม่สามารถคำนวณช่วงเวลาเปรียบเทียบได้");
+        err.status = 400;
+        throw err;
+      }
+
+      const filterIds = resolveFilterIds(query);
+      const { machineIds } = filterIds;
+
+      const machineWhere = ["m.is_active = 1"];
+      const machineParams = [];
+      if (machineIds.length) {
+        machineWhere.push(`m.id IN (${machineIds.map(() => "?").join(", ")})`);
+        machineParams.push(...machineIds);
+      }
+      const [machineRows] = await pool.query(
+        `SELECT m.id, m.name
+         FROM machines m
+         WHERE ${machineWhere.join(" AND ")}
+         ORDER BY m.name ASC`,
+        machineParams,
+      );
+
+      const combinedRange = {
+        from: periods[0].from,
+        to: periods[periods.length - 1].to,
+      };
+      const { whereSql, params } = buildWhere({ ...combinedRange, ...filterIds });
+      const bucketExpr = trendBucketSql(grain);
+      const moneyExpr = `CASE
+        WHEN rr.claim_sheet_qty IS NULL OR rr.price_per_sheet IS NULL THEN 0
+        ELSE rr.claim_sheet_qty * rr.price_per_sheet
+      END`;
+      const weightExpr = `CASE
+        WHEN rr.claim_sheet_qty IS NULL OR rr.weight_per_sheet IS NULL THEN 0
+        ELSE rr.claim_sheet_qty * rr.weight_per_sheet
+      END`;
+
+      const [rows] = await pool.query(
+        `SELECT
+           ${bucketExpr} AS period_start,
+           rr.machine_id AS machine_id,
+           COUNT(*) AS count,
+           COALESCE(SUM(rr.claim_sheet_qty), 0) AS claim_sheet_qty,
+           COALESCE(SUM(${moneyExpr}), 0) AS reject_amount,
+           COALESCE(SUM(${weightExpr}), 0) AS reject_weight,
+           COALESCE(SUM(rr.destroy_bl_weight), 0) AS destroy_bl_weight,
+           COALESCE(SUM(rr.destroy_bl_amount), 0) AS destroy_bl_amount,
+           COALESCE(SUM(rr.return_to_customer_qty), 0) AS return_to_customer_qty,
+           COALESCE(SUM(rr.return_amount), 0) AS return_amount
+         FROM reject_records rr
+         ${whereSql}
+         GROUP BY ${bucketExpr}, rr.machine_id
+         ORDER BY period_start ASC`,
+        params,
+      );
+
+      const machines = machineRows.map((row) => ({
+        key: `machine_${row.id}`,
+        id: Number(row.id),
+        name: row.name,
+      }));
+      const machineKeyById = new Map(machines.map((item) => [item.id, item.key]));
+
+      const emptyCell = () => ({
+        count: 0,
+        claim_sheet_qty: 0,
+        reject_amount: 0,
+        reject_weight: 0,
+        destroy_bl_weight: 0,
+        destroy_bl_amount: 0,
+        return_to_customer_qty: 0,
+        return_amount: 0,
+      });
+      const addCell = (target, source) => {
+        target.count += Number(source.count || 0);
+        target.claim_sheet_qty += Number(source.claim_sheet_qty || 0);
+        target.reject_amount += Number(source.reject_amount || 0);
+        target.reject_weight += Number(source.reject_weight || 0);
+        target.destroy_bl_weight += Number(source.destroy_bl_weight || 0);
+        target.destroy_bl_amount += Number(source.destroy_bl_amount || 0);
+        target.return_to_customer_qty += Number(source.return_to_customer_qty || 0);
+        target.return_amount += Number(source.return_amount || 0);
+      };
+
+      const resultRows = periods.map((period) => ({
+        key: period.key,
+        label: period.label,
+        from: period.from,
+        to: period.to,
+        current: period.current,
+        cells: Object.fromEntries(machines.map((item) => [item.key, emptyCell()])),
+        total: emptyCell(),
+      }));
+      const rowByStart = new Map(resultRows.map((row) => [row.from, row]));
+
+      // Records whose machine is missing or de-activated still belong in the totals.
+      let hasOther = false;
+      for (const row of rows) {
+        const bucket = rowByStart.get(normalizeDate(row.period_start));
+        if (!bucket) continue;
+        const machineKey = machineKeyById.get(Number(row.machine_id)) || MACHINE_OTHER_KEY;
+        if (machineKey === MACHINE_OTHER_KEY) hasOther = true;
+        if (!bucket.cells[machineKey]) bucket.cells[machineKey] = emptyCell();
+        addCell(bucket.cells[machineKey], row);
+        addCell(bucket.total, row);
+      }
+
+      const columns = hasOther
+        ? [...machines, { key: MACHINE_OTHER_KEY, id: null, name: "อื่นๆ / ไม่ระบุเครื่อง" }]
+        : machines;
+
+      const totals = {
+        cells: Object.fromEntries(columns.map((item) => [item.key, emptyCell()])),
+        total: emptyCell(),
+      };
+      for (const row of resultRows) {
+        for (const column of columns) {
+          if (!row.cells[column.key]) row.cells[column.key] = emptyCell();
+          addCell(totals.cells[column.key], row.cells[column.key]);
+        }
+        addCell(totals.total, row.total);
+      }
+
+      return {
+        grain,
+        periods_count: buckets.count,
+        periods_options: buckets.options,
+        filters: {
+          period: range.period,
+          from: combinedRange.from,
+          to: combinedRange.to,
+          machine_ids: machineIds,
+          department_ids: filterIds.departmentIds,
+          shifts: filterIds.shifts,
+          job_types: filterIds.jobTypes,
+        },
+        machines: columns,
+        rows: resultRows,
+        totals,
+      };
+    },
+
     async getRejectDayDetail(query = {}) {
       return fetchDayDetail(query);
     },
@@ -926,7 +1291,7 @@ function formatTrendLabel(date, grain) {
     return `${y}-${m}`;
   }
   if (grain === "week") {
-    // date = Monday of that week
+    // date = Sunday of that week
     return date;
   }
   return date;

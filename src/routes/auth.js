@@ -14,6 +14,7 @@ function toPublicUser(user) {
     username: user.username,
     display_name: user.display_name,
     role: user.role,
+    department: user.department || null,
   };
 }
 
@@ -44,6 +45,7 @@ export function registerAuthRoutes(app, { pool, wrap, requireAuth }) {
           sub: user.id,
           username: user.username,
           role: user.role,
+          department: user.department || null,
           display_name: user.display_name,
         },
         config.jwtSecret,
@@ -89,5 +91,6 @@ export async function seedAdminUser(pool) {
     passwordHash,
     displayName: "ผู้ดูแลระบบ",
     role: "admin",
+    department: null,
   });
 }

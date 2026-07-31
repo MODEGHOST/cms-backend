@@ -10,7 +10,14 @@
     "dev": "node --watch src/server.js",
     "start": "node src/server.js",
     "db:init": "node scripts/init-db.js",
+    "db:ensure-user-department": "node scripts/ensure-user-department.js",
+    "db:ensure-activity-logs": "node scripts/ensure-activity-logs.js",
+    "db:ensure-complaint-tables": "node scripts/ensure-complaint-tables.js",
+    "db:ensure-company-name-en": "node scripts/ensure-company-name-en.js",
+    "db:sync-company-name-en": "node scripts/sync-company-name-en-from-complaint.js",
     "db:import-reject": "node scripts/import-reject-excel.js",
+    "db:import-complaint": "node scripts/import-complaint-excel.js",
+    "db:seed-complaint-users": "node scripts/seed-complaint-test-users.js",
     "check": "node scripts/check-syntax.js",
     "test": "node --test"
   },
@@ -22,6 +29,7 @@
     "express": "^5.1.0",
     "helmet": "^8.3.0",
     "jsonwebtoken": "^9.0.2",
+    "multer": "^2.2.0",
     "mysql2": "^3.14.3",
     "xlsx": "^0.18.5"
   }

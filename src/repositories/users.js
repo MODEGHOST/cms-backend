@@ -2,7 +2,7 @@ export function createUserRepository(pool) {
   return {
     async findByUsername(username) {
       const [rows] = await pool.query(
-        `SELECT id, username, password_hash, display_name, role, is_active
+        `SELECT id, username, password_hash, display_name, role, department, is_active
          FROM users
          WHERE username = ?
          LIMIT 1`,
@@ -13,7 +13,7 @@ export function createUserRepository(pool) {
 
     async findById(id) {
       const [rows] = await pool.query(
-        `SELECT id, username, display_name, role, is_active
+        `SELECT id, username, display_name, role, department, is_active
          FROM users
          WHERE id = ?
          LIMIT 1`,
@@ -27,11 +27,11 @@ export function createUserRepository(pool) {
       return Number(count);
     },
 
-    async create({ username, passwordHash, displayName, role = "staff" }) {
+    async create({ username, passwordHash, displayName, role = "staff", department = null }) {
       const [result] = await pool.query(
-        `INSERT INTO users (username, password_hash, display_name, role)
-         VALUES (?, ?, ?, ?)`,
-        [username, passwordHash, displayName, role],
+        `INSERT INTO users (username, password_hash, display_name, role, department)
+         VALUES (?, ?, ?, ?, ?)`,
+        [username, passwordHash, displayName, role, department],
       );
       return result.insertId;
     },

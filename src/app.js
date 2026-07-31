@@ -12,7 +12,9 @@ import { registerAuthRoutes } from "./routes/auth.js";
 import { registerHealthRoutes } from "./routes/health.js";
 import { registerMasterRoutes } from "./routes/masters.js";
 import { registerRejectRoutes } from "./routes/rejects.js";
+import { registerComplaintRoutes } from "./routes/complaints.js";
 import { registerDashboardRoutes } from "./routes/dashboard.js";
+import { registerActivityLogRoutes } from "./routes/activity-logs.js";
 
 export function createApplication() {
   const app = express();
@@ -40,7 +42,9 @@ export function createApplication() {
   registerAuthRoutes(app, { pool, wrap, requireAuth });
   registerMasterRoutes(app, { pool, wrap, requireAuth });
   registerRejectRoutes(app, { pool, wrap, requireAuth });
+  registerComplaintRoutes(app, { pool, wrap, requireAuth });
   registerDashboardRoutes(app, { pool, wrap, requireAuth });
+  registerActivityLogRoutes(app, { pool, wrap, requireAuth });
 
   app.use((err, _req, res, _next) => {
     logger.error(err);

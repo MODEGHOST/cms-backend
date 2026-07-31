@@ -3,8 +3,8 @@ import { parsePagination, paginatedJson } from "../validators/common.js";
 const MASTER_CONFIG = {
   companies: {
     table: "companies",
-    searchable: ["name"],
-    fields: ["id", "name", "is_active", "created_at", "updated_at"],
+    searchable: ["name", "name_en"],
+    fields: ["id", "name", "name_en", "is_active", "created_at", "updated_at"],
   },
   departments: {
     table: "departments",
@@ -18,8 +18,8 @@ const MASTER_CONFIG = {
   },
   problems: {
     table: "problems",
-    searchable: ["name"],
-    fields: ["id", "name", "is_active", "created_at", "updated_at"],
+    searchable: ["name", "name_en"],
+    fields: ["id", "name", "name_en", "is_active", "created_at", "updated_at"],
   },
   shifts: {
     table: "shifts",
@@ -77,8 +77,22 @@ export function createMasterRepository(pool) {
       return paginatedJson(rows, Number(total), { page, pageSize });
     },
 
-    async createSimple(key, { name, is_active = 1 }) {
+    async createSimple(key, { name, name_en = null, is_active = 1 }) {
       const cfg = getConfig(key);
+      const hasNameEn = cfg.fields.includes("name_en");
+      if (hasNameEn) {
+        const [result] = await pool.query(
+          `INSERT INTO ${cfg.table} (name, name_en, is_active) VALUES (?, ?, ?)`,
+          [
+            String(name).trim(),
+            name_en == null || String(name_en).trim() === ""
+              ? null
+              : String(name_en).trim(),
+            is_active ? 1 : 0,
+          ],
+        );
+        return result.insertId;
+      }
       const [result] = await pool.query(
         `INSERT INTO ${cfg.table} (name, is_active) VALUES (?, ?)`,
         [String(name).trim(), is_active ? 1 : 0],
@@ -86,13 +100,21 @@ export function createMasterRepository(pool) {
       return result.insertId;
     },
 
-    async updateSimple(key, id, { name, is_active }) {
+    async updateSimple(key, id, { name, name_en, is_active }) {
       const cfg = getConfig(key);
       const fields = [];
       const values = [];
       if (name != null) {
         fields.push("name = ?");
         values.push(String(name).trim());
+      }
+      if (cfg.fields.includes("name_en") && name_en !== undefined) {
+        fields.push("name_en = ?");
+        values.push(
+          name_en == null || String(name_en).trim() === ""
+            ? null
+            : String(name_en).trim(),
+        );
       }
       if (is_active != null) {
         fields.push("is_active = ?");
@@ -182,6 +204,48 @@ export function createMasterRepository(pool) {
       return result.affectedRows > 0;
     },
 
+    async listAliasNamesByCompanyId(companyId) {
+      const [rows] = await pool.query(
+        `SELECT name FROM customer_aliases
+         WHERE company_id = ? AND is_active = 1
+         ORDER BY name ASC`,
+        [Number(companyId)],
+      );
+      return rows.map((row) => row.name);
+    },
+
+    /** Insert missing nicknames for a company; does not delete existing ones. */
+    async ensureAliases(companyId, names = []) {
+      const cleaned = [
+        ...new Set(
+          (Array.isArray(names) ? names : [])
+            .map((name) => String(name || "").trim())
+            .filter(Boolean),
+        ),
+      ];
+      for (const name of cleaned) {
+        const [existing] = await pool.query(
+          `SELECT id FROM customer_aliases
+           WHERE company_id = ? AND name = ?
+           LIMIT 1`,
+          [Number(companyId), name],
+        );
+        if (existing.length) {
+          await pool.query(
+            `UPDATE customer_aliases SET is_active = 1 WHERE id = ?`,
+            [existing[0].id],
+          );
+          continue;
+        }
+        await pool.query(
+          `INSERT INTO customer_aliases (company_id, name, is_active)
+           VALUES (?, ?, 1)`,
+          [Number(companyId), name],
+        );
+      }
+      return cleaned;
+    },
+
     async findById(key, id) {
       if (key === "customer-aliases") {
         const [rows] = await pool.query(
@@ -200,7 +264,15 @@ export function createMasterRepository(pool) {
         `SELECT ${cfg.fields.join(", ")} FROM ${cfg.table} WHERE id = ? LIMIT 1`,
         [id],
       );
-      return rows[0] || null;
+      const row = rows[0] || null;
+      if (!row || key !== "companies") return row;
+      const [aliasRows] = await pool.query(
+        `SELECT name FROM customer_aliases
+         WHERE company_id = ? AND is_active = 1
+         ORDER BY name ASC`,
+        [id],
+      );
+      return { ...row, aliases: aliasRows.map((item) => item.name) };
     },
   };
 }
