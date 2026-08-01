@@ -1,4 +1,5 @@
 import { toDateOnly } from "../validators/common.js";
+import { canCsWork, canDepartmentWork, canQaWork, isCmsAdmin } from "../core/authz.js";
 
 const TEXT = "text";
 const NUMBER = "number";
@@ -148,15 +149,11 @@ function resolveQaNextStatus(documentAccepted) {
 }
 
 function isCsUser(actor) {
-  if (actor.role === "admin") return true;
-  const department = String(actor.department || "").trim().toUpperCase();
-  return department === "CS" || department === "CUSTOMER SERVICE";
+  return canCsWork(actor);
 }
 
 function isQaUser(actor) {
-  if (actor.role === "admin") return true;
-  const department = String(actor.department || "").trim().toUpperCase();
-  return department === "QA" || department === "QC";
+  return canQaWork(actor);
 }
 
 function normalizeDeptName(value) {
@@ -164,20 +161,20 @@ function normalizeDeptName(value) {
 }
 
 function isResponsibleDepartmentUser(actor, record) {
-  if (actor.role === "admin") return true;
+  if (isCmsAdmin(actor)) return true;
+  if (!canDepartmentWork(actor)) return false;
   const userDept = normalizeDeptName(actor.department);
   const responsible = normalizeDeptName(record.responsible_department_name);
   return Boolean(userDept && responsible && userDept === responsible);
 }
 
 function canWork(status, actor, record) {
-  if (actor.role === "admin") return true;
-  const department = normalizeDeptName(actor.department);
+  if (isCmsAdmin(actor)) return true;
   if (status === "cs_draft" || status === "pending_qa") {
     return isCsUser(actor) || (status === "pending_qa" && isQaUser(actor));
   }
   if (status === "qa_review" || status === "qa_confirm") {
-    return department === "QA" || department === "QC";
+    return isQaUser(actor);
   }
   if (status === "pending_department") {
     return isQaUser(actor) || isResponsibleDepartmentUser(actor, record);
@@ -216,7 +213,7 @@ export function createComplaintService(complaints, activityLogs) {
 
       // เติมช่องเอกสารอัตโนมัติถ้าว่าง (กรณีรับเรื่องก่อนมีฟีเจอร์ หรือ backend ยังไม่รีสตาร์ท)
       if (status === "department_action" && payload.action === "ensure_doc_fields") {
-        if (!isResponsibleDepartmentUser(actor, current) && actor.role !== "admin") {
+        if (!isResponsibleDepartmentUser(actor, current)) {
           const error = new Error(
             `เฉพาะหน่วยงานที่รับผิดชอบ (${current.responsible_department_name || "-"}) เท่านั้น`,
           );

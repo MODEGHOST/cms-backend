@@ -33,6 +33,9 @@ export function loadConfig(env = process.env) {
       database: env.DB_NAME || "cms",
       connectionLimit: Number(env.DB_POOL_LIMIT || 20),
     }),
+    // Central SSO identity: shared_auth.Center_user_lfb (no app roles here).
+    sharedDbName: env.SHARED_DB_NAME || "shared_auth",
+    centerUserTable: env.CENTER_USER_TABLE || "Center_user_lfb",
   });
 }
 

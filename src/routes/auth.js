@@ -14,8 +14,19 @@ function toPublicUser(user) {
     username: user.username,
     display_name: user.display_name,
     role: user.role,
+    roles: user.roles || [],
+    permissions: user.permissions || [],
     department: user.department || null,
   };
+}
+
+function canUseCms(user) {
+  return Boolean(
+    user &&
+      user.is_active &&
+      user.roles?.length &&
+      user.shared_status !== "suspended",
+  );
 }
 
 export function registerAuthRoutes(app, { pool, wrap, requireAuth }) {
@@ -31,7 +42,7 @@ export function registerAuthRoutes(app, { pool, wrap, requireAuth }) {
       }
 
       const user = await users.findByUsername(username);
-      if (!user || !user.is_active) {
+      if (!user?.password_hash) {
         throw httpError(401, "ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง");
       }
 
@@ -40,13 +51,25 @@ export function registerAuthRoutes(app, { pool, wrap, requireAuth }) {
         throw httpError(401, "ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง");
       }
 
+      if (!canUseCms(user)) {
+        throw httpError(
+          403,
+          "บัญชีนี้ยังไม่ได้รับสิทธิ์เข้าใช้งาน CMS (ไม่มี cms membership/role)",
+        );
+      }
+
+      await users.upsertLocalProfile({
+        id: user.id,
+        username: user.username,
+        displayName: user.display_name,
+        department: user.department,
+        isActive: true,
+      });
+
       const token = jwt.sign(
         {
           sub: user.id,
           username: user.username,
-          role: user.role,
-          department: user.department || null,
-          display_name: user.display_name,
         },
         config.jwtSecret,
         { expiresIn: config.authTokenTtl },
@@ -69,12 +92,17 @@ export function registerAuthRoutes(app, { pool, wrap, requireAuth }) {
     "/api/auth/me",
     requireAuth,
     wrap(async (req, res) => {
-      const user = await users.findById(req.user.sub);
-      if (!user || !user.is_active) {
-        clearSessionCookie(res);
-        throw httpError(401, "Unauthorized");
-      }
-      res.json({ user: toPublicUser(user) });
+      res.json({
+        user: toPublicUser({
+          id: req.user.id,
+          username: req.user.username,
+          display_name: req.user.display_name,
+          role: req.user.role,
+          roles: req.user.roles,
+          permissions: req.user.permissions,
+          department: req.user.department,
+        }),
+      });
     }),
   );
 }
@@ -82,15 +110,15 @@ export function registerAuthRoutes(app, { pool, wrap, requireAuth }) {
 export async function seedAdminUser(pool) {
   if (!config.seedDemoData) return;
   const users = createUserRepository(pool);
-  const count = await users.countAll();
+  const count = await users.countMemberships();
   if (count > 0) return;
 
-  const passwordHash = await bcrypt.hash("Admin123!", 10);
   await users.create({
     username: "admin",
-    passwordHash,
+    passwordHash: await bcrypt.hash("Admin123!", 10),
     displayName: "ผู้ดูแลระบบ",
     role: "admin",
     department: null,
+    email: "admin@cms.local",
   });
 }

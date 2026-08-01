@@ -8,11 +8,14 @@ CREATE DATABASE IF NOT EXISTS cms
 
 USE cms;
 
--- ---------- Auth ----------
+-- ---------- Auth (local profile + CMS role) ----------
+-- Credentials (password) live in shared identity DB: lfbsmart_project.users
+-- cms.users.id must match the shared user id after migration.
+-- Legacy columns password_hash/role remain for compatibility; auth reads shared DB + cms_memberships.
 CREATE TABLE IF NOT EXISTS users (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   username VARCHAR(80) NOT NULL,
-  password_hash VARCHAR(255) NOT NULL,
+  password_hash VARCHAR(255) NOT NULL DEFAULT '',
   display_name VARCHAR(120) NOT NULL,
   role ENUM('admin', 'staff') NOT NULL DEFAULT 'staff',
   -- Department is separate from role (e.g. QC, Production). NULL = no dept.
@@ -23,6 +26,58 @@ CREATE TABLE IF NOT EXISTS users (
   PRIMARY KEY (id),
   UNIQUE KEY uq_users_username (username),
   KEY idx_users_department (department)
+) ENGINE=InnoDB;
+
+-- CMS-only role/access (RBAC). Credentials live in shared_auth.Center_user_lfb.
+CREATE TABLE IF NOT EXISTS cms_roles (
+  id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  name VARCHAR(64) NOT NULL,
+  label VARCHAR(120) NOT NULL,
+  description VARCHAR(255) NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_cms_roles_name (name)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS cms_permissions (
+  id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  code VARCHAR(100) NOT NULL,
+  description VARCHAR(255) NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_cms_permissions_code (code)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS cms_role_permissions (
+  role_id INT UNSIGNED NOT NULL,
+  permission_id INT UNSIGNED NOT NULL,
+  PRIMARY KEY (role_id, permission_id),
+  CONSTRAINT fk_cms_rp_role
+    FOREIGN KEY (role_id) REFERENCES cms_roles (id) ON DELETE CASCADE,
+  CONSTRAINT fk_cms_rp_permission
+    FOREIGN KEY (permission_id) REFERENCES cms_permissions (id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS cms_memberships (
+  user_id BIGINT UNSIGNED NOT NULL,
+  is_active TINYINT(1) NOT NULL DEFAULT 1,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (user_id),
+  CONSTRAINT fk_cms_memberships_user
+    FOREIGN KEY (user_id) REFERENCES users (id)
+    ON UPDATE CASCADE ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS cms_membership_roles (
+  user_id BIGINT UNSIGNED NOT NULL,
+  role_id INT UNSIGNED NOT NULL,
+  assigned_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (user_id, role_id),
+  CONSTRAINT fk_cms_mr_user
+    FOREIGN KEY (user_id) REFERENCES cms_memberships (user_id) ON DELETE CASCADE,
+  CONSTRAINT fk_cms_mr_role
+    FOREIGN KEY (role_id) REFERENCES cms_roles (id) ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
 -- ---------- Masters ----------

@@ -107,6 +107,8 @@ export function registerComplaintRoutes(app, { pool, wrap, requireAuth }) {
             username: dbUser.username,
             display_name: dbUser.display_name,
             role: dbUser.role,
+            roles: dbUser.roles || [],
+            permissions: dbUser.permissions || [],
             department: dbUser.department,
           },
         );
@@ -170,6 +172,8 @@ export function registerComplaintRoutes(app, { pool, wrap, requireAuth }) {
             username: dbUser.username,
             display_name: dbUser.display_name,
             role: dbUser.role,
+            roles: dbUser.roles || [],
+            permissions: dbUser.permissions || [],
             department: dbUser.department,
           },
         );
@@ -275,6 +279,8 @@ export function registerComplaintRoutes(app, { pool, wrap, requireAuth }) {
         username: dbUser.username,
         display_name: dbUser.display_name,
         role: dbUser.role,
+        roles: dbUser.roles || [],
+        permissions: dbUser.permissions || [],
         department: dbUser.department,
       });
       res.json({

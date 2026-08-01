@@ -1,4 +1,5 @@
 import { createMasterService } from "../services/masters.js";
+import { canManageMasters, hasPermission } from "../core/authz.js";
 
 /**
  * Master APIs — filtering / search / pagination happen on backend.
@@ -20,6 +21,9 @@ export function registerMasterRoutes(app, { pool, wrap, requireAuth }) {
       `/api/masters/${key}`,
       requireAuth,
       wrap(async (req, res) => {
+        if (!hasPermission(req.user, "masters.read") && !canManageMasters(req.user)) {
+          return res.status(403).json({ message: "ไม่มีสิทธิ์ดู Master" });
+        }
         const result = await masters.list(key, req.query);
         res.json(result);
       }),
@@ -29,6 +33,9 @@ export function registerMasterRoutes(app, { pool, wrap, requireAuth }) {
       `/api/masters/${key}`,
       requireAuth,
       wrap(async (req, res) => {
+        if (!canManageMasters(req.user)) {
+          return res.status(403).json({ message: "ไม่มีสิทธิ์จัดการ Master" });
+        }
         const row = await masters.create(key, req.body || {});
         res.status(201).json({ data: row });
       }),
@@ -38,6 +45,9 @@ export function registerMasterRoutes(app, { pool, wrap, requireAuth }) {
       `/api/masters/${key}/:id`,
       requireAuth,
       wrap(async (req, res) => {
+        if (!canManageMasters(req.user)) {
+          return res.status(403).json({ message: "ไม่มีสิทธิ์จัดการ Master" });
+        }
         const row = await masters.update(key, req.params.id, req.body || {});
         res.json({ data: row });
       }),

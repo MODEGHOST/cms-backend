@@ -1,11 +1,12 @@
 /**
- * Ensure users.department column exists and seed a QC staff user.
+ * Ensure cms_memberships exists and seed a QC staff user via shared identity.
  * Safe to re-run.
  */
 import "../src/core/load-env.js";
 import bcrypt from "bcryptjs";
 import mysql from "mysql2/promise";
 import { config } from "../src/core/config.js";
+import { createUserRepository } from "../src/repositories/users.js";
 
 async function ensureDepartmentColumn(conn) {
   const [cols] = await conn.query(
@@ -24,29 +25,23 @@ async function ensureDepartmentColumn(conn) {
   return true;
 }
 
-async function ensureQcUser(conn) {
-  const [[existing]] = await conn.query(
-    `SELECT id, username, department FROM users WHERE username = ? LIMIT 1`,
-    ["qc"],
-  );
-  if (existing) {
-    if (!existing.department) {
-      await conn.query(`UPDATE users SET department = 'QC' WHERE id = ?`, [existing.id]);
-    }
-    return { created: false, id: existing.id };
-  }
-
-  const passwordHash = await bcrypt.hash("Qc123!", 10);
-  const [result] = await conn.query(
-    `INSERT INTO users (username, password_hash, display_name, role, department, is_active)
-     VALUES (?, ?, ?, 'staff', 'QC', 1)`,
-    ["qc", passwordHash, "เจ้าหน้าที่ QC"],
-  );
-  return { created: true, id: result.insertId };
+async function ensureMembershipsTable(conn) {
+  await conn.query(`
+    CREATE TABLE IF NOT EXISTS cms_memberships (
+      user_id BIGINT UNSIGNED NOT NULL,
+      role ENUM('admin', 'staff') NOT NULL DEFAULT 'staff',
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (user_id),
+      CONSTRAINT fk_cms_memberships_user
+        FOREIGN KEY (user_id) REFERENCES users (id)
+        ON UPDATE CASCADE ON DELETE CASCADE
+    ) ENGINE=InnoDB
+  `);
 }
 
 async function main() {
-  const conn = await mysql.createConnection({
+  const pool = mysql.createPool({
     host: config.db.host,
     port: config.db.port,
     user: config.db.user,
@@ -55,13 +50,47 @@ async function main() {
   });
 
   try {
-    const addedColumn = await ensureDepartmentColumn(conn);
-    const qc = await ensureQcUser(conn);
-    const [rows] = await conn.query(
-      `SELECT id, username, display_name, role, department, is_active
-       FROM users
-       ORDER BY id ASC`,
+    const conn = await pool.getConnection();
+    let addedColumn = false;
+    try {
+      addedColumn = await ensureDepartmentColumn(conn);
+      await ensureMembershipsTable(conn);
+    } finally {
+      conn.release();
+    }
+
+    const users = createUserRepository(pool);
+    const existing = await users.findByUsername("qc");
+    let qc;
+    if (existing?.role) {
+      if (!existing.department) {
+        await users.upsertLocalProfile({
+          id: existing.id,
+          username: existing.username,
+          displayName: existing.display_name,
+          department: "QC",
+          isActive: true,
+        });
+      }
+      qc = { created: false, id: existing.id };
+    } else {
+      const id = await users.create({
+        username: "qc",
+        passwordHash: await bcrypt.hash("Qc123!", 10),
+        displayName: "เจ้าหน้าที่ QC",
+        role: "staff",
+        department: "QC",
+      });
+      qc = { created: true, id };
+    }
+
+    const [rows] = await pool.query(
+      `SELECT p.id, p.username, p.display_name, m.role, p.department, p.is_active
+       FROM users p
+       LEFT JOIN cms_memberships m ON m.user_id = p.id
+       ORDER BY p.id ASC`,
     );
+
     console.log(
       JSON.stringify(
         {
@@ -74,7 +103,7 @@ async function main() {
       ),
     );
   } finally {
-    await conn.end();
+    await pool.end();
   }
 }
 

@@ -15,13 +15,14 @@ import { registerRejectRoutes } from "./routes/rejects.js";
 import { registerComplaintRoutes } from "./routes/complaints.js";
 import { registerDashboardRoutes } from "./routes/dashboard.js";
 import { registerActivityLogRoutes } from "./routes/activity-logs.js";
+import { registerSystemRoutes } from "./routes/system.js";
 
 export function createApplication() {
   const app = express();
   app.set("trust proxy", config.trustProxy);
 
   const pool = createPool();
-  const requireAuth = createAuth();
+  const requireAuth = createAuth(pool);
 
   app.use(helmet());
   app.use(
@@ -45,6 +46,7 @@ export function createApplication() {
   registerComplaintRoutes(app, { pool, wrap, requireAuth });
   registerDashboardRoutes(app, { pool, wrap, requireAuth });
   registerActivityLogRoutes(app, { pool, wrap, requireAuth });
+  registerSystemRoutes(app, { pool, wrap, requireAuth });
 
   app.use((err, _req, res, _next) => {
     logger.error(err);

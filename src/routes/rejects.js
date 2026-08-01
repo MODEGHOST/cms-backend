@@ -2,6 +2,7 @@ import { createRejectRepository } from "../repositories/rejects.js";
 import { createActivityLogRepository } from "../repositories/activity-logs.js";
 import { createUserRepository } from "../repositories/users.js";
 import { createRejectService } from "../services/rejects.js";
+import { canUpdateRejects } from "../core/authz.js";
 
 /** Reject record routes — lookup + QC update. */
 export function registerRejectRoutes(app, { pool, wrap, requireAuth }) {
@@ -87,19 +88,21 @@ export function registerRejectRoutes(app, { pool, wrap, requireAuth }) {
       }
 
       const dbUser = await users.findById(req.user.sub);
-      const department = String(dbUser?.department || req.user?.department || "").toUpperCase();
-      const role = String(dbUser?.role || req.user?.role || "");
-      if (department !== "QC" && role !== "admin") {
-        const error = new Error("เฉพาะแผนก QC หรือผู้ดูแลระบบเท่านั้นที่แก้ไขได้");
+      const actor = dbUser || req.user;
+      if (!canUpdateRejects(actor)) {
+        const error = new Error("ไม่มีสิทธิ์แก้ไข Reject (ต้องมี rejects.update)");
         error.status = 403;
         throw error;
       }
 
       const result = await rejectService.updateQcFields(id, req.body || {}, {
-        id: dbUser?.id || req.user?.sub,
-        username: dbUser?.username || req.user?.username,
-        display_name: dbUser?.display_name || req.user?.display_name,
-        department: dbUser?.department || req.user?.department || null,
+        id: actor.id || req.user.sub,
+        username: actor.username,
+        display_name: actor.display_name,
+        department: actor.department || null,
+        role: actor.role,
+        roles: actor.roles || [],
+        permissions: actor.permissions || [],
       });
 
       res.json({
