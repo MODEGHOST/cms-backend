@@ -61,11 +61,67 @@ export function createComplaintRepository(pool) {
       return rows[0] || null;
     },
 
-    async listAttachments(complaintId) {
+    async listInbox({ whereSql, params = [], q, limit, offset }) {
+      const filters = [whereSql];
+      const values = [...params];
+      const keyword = String(q || "").trim();
+      if (keyword) {
+        filters.push(
+          `(cr.pdr_no LIKE ? OR c.name LIKE ? OR p.name LIKE ? OR COALESCE(responsible.name, '') LIKE ?)`,
+        );
+        const like = `%${keyword}%`;
+        values.push(like, like, like, like);
+      }
+      const where = `WHERE ${filters.join(" AND ")}`;
+
+      const [countRows] = await pool.query(
+        `SELECT COUNT(*) AS total
+         FROM complaint_records cr
+         LEFT JOIN companies c ON c.id = cr.company_id
+         LEFT JOIN problems p ON p.id = cr.problem_id
+         LEFT JOIN departments responsible ON responsible.id = cr.responsible_department_id
+         ${where}`,
+        values,
+      );
+      const [rows] = await pool.query(
+        `${detailSelect}
+         ${where}
+         ORDER BY
+           CASE cr.workflow_status
+             WHEN 'pending_qa' THEN 1
+             WHEN 'qa_review' THEN 2
+             WHEN 'pending_department' THEN 3
+             WHEN 'department_action' THEN 4
+             WHEN 'qa_confirm' THEN 5
+             WHEN 'cs_draft' THEN 6
+             ELSE 7
+           END,
+           cr.received_date DESC,
+           cr.id DESC
+         LIMIT ? OFFSET ?`,
+        [...values, limit, offset],
+      );
+      return { rows, total: Number(countRows[0]?.total || 0) };
+    },
+
+    async countInbox({ whereSql, params = [] }) {
+      const [rows] = await pool.query(
+        `SELECT COUNT(*) AS total
+         FROM complaint_records cr
+         LEFT JOIN departments responsible ON responsible.id = cr.responsible_department_id
+         WHERE ${whereSql}`,
+        params,
+      );
+      return Number(rows[0]?.total || 0);
+    },
+
+    async listAttachments(complaintId, { includeStoredName = false } = {}) {
       const [rows] = await pool.query(
         `SELECT
            ca.id,
+           ca.kind,
            ca.original_name,
+           ca.stored_name,
            ca.mime_type,
            ca.file_size,
            ca.created_at,
@@ -73,13 +129,23 @@ export function createComplaintRepository(pool) {
          FROM complaint_attachments ca
          LEFT JOIN users u ON u.id = ca.uploaded_by
          WHERE ca.complaint_id = ?
-         ORDER BY ca.created_at ASC, ca.id ASC`,
+         ORDER BY ca.kind ASC, ca.created_at ASC, ca.id ASC`,
         [complaintId],
       );
-      return rows.map((row) => ({
-        ...row,
-        url: `/api/complaint-attachments/${row.id}/download`,
-      }));
+      return rows.map((row) => {
+        const base = {
+          id: row.id,
+          kind: row.kind === "signature" ? "signature" : "file",
+          original_name: row.original_name,
+          mime_type: row.mime_type,
+          file_size: row.file_size,
+          created_at: row.created_at,
+          uploaded_by_name: row.uploaded_by_name,
+          url: `/api/complaint-attachments/${row.id}/download`,
+        };
+        if (includeStoredName) base.stored_name = row.stored_name;
+        return base;
+      });
     },
 
     async findAttachmentById(id) {
@@ -90,14 +156,17 @@ export function createComplaintRepository(pool) {
       return rows[0] || null;
     },
 
-    async createAttachments(complaintId, files, uploadedBy) {
+    async createAttachments(complaintId, files, uploadedBy, kind = "file") {
+      const attachmentKind = kind === "signature" ? "signature" : "file";
+      const ids = [];
       for (const file of files) {
-        await pool.query(
+        const [result] = await pool.query(
           `INSERT INTO complaint_attachments
-             (complaint_id, original_name, stored_name, mime_type, file_size, uploaded_by)
-           VALUES (?, ?, ?, ?, ?, ?)`,
+             (complaint_id, kind, original_name, stored_name, mime_type, file_size, uploaded_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
           [
             complaintId,
+            attachmentKind,
             file.originalname,
             file.filename,
             file.mimetype || null,
@@ -105,7 +174,16 @@ export function createComplaintRepository(pool) {
             uploadedBy || null,
           ],
         );
+        ids.push(result.insertId);
       }
+      return ids;
+    },
+
+    async updatePlanFormJson(id, planForm) {
+      await pool.query(`UPDATE complaint_records SET plan_form_json = ? WHERE id = ?`, [
+        planForm == null ? null : JSON.stringify(planForm),
+        id,
+      ]);
     },
 
     async deleteAttachments(complaintId, attachmentIds) {

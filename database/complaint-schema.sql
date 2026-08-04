@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS complaint_records (
   correction TEXT NULL,
   prevention TEXT NULL,
   remark TEXT NULL,
+  plan_form_json JSON NULL,
 
   workflow_status ENUM(
     'cs_draft', 'pending_qa', 'qa_review', 'pending_department', 'department_action', 'qa_confirm', 'completed'
@@ -141,6 +142,7 @@ CREATE TABLE IF NOT EXISTS complaint_records (
 CREATE TABLE IF NOT EXISTS complaint_attachments (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   complaint_id BIGINT UNSIGNED NOT NULL,
+  kind ENUM('file', 'signature') NOT NULL DEFAULT 'file',
   original_name VARCHAR(255) NOT NULL,
   stored_name VARCHAR(255) NOT NULL,
   mime_type VARCHAR(120) NULL,
@@ -149,6 +151,7 @@ CREATE TABLE IF NOT EXISTS complaint_attachments (
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
   KEY idx_complaint_attachments_complaint (complaint_id),
+  KEY idx_complaint_attachments_kind (complaint_id, kind),
   CONSTRAINT fk_complaint_attachments_complaint
     FOREIGN KEY (complaint_id) REFERENCES complaint_records (id)
     ON UPDATE CASCADE ON DELETE CASCADE,

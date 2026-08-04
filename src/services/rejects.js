@@ -1,13 +1,15 @@
 import { toDateOnly } from "../validators/common.js";
+import { parseShipQty } from "../utils/parse-ship-qty.js";
 
 export const QC_FIELD_META = {
+  doc_notify_date: { label: "วันที่แจ้งเอกสาร", type: "date" },
   reject_received_date: { label: "รับ Reject", type: "date" },
   invoice_no: { label: "Invoice", type: "text" },
   department_name: { label: "หน่วยงานที่รับผิดชอบ", type: "master" },
   problem_name: { label: "ปัญหา", type: "master" },
   cause: { label: "สาเหตุ", type: "text" },
   job_type: { label: "ลักษณะงาน", type: "text" },
-  actual_ship_qty: { label: "ยอดส่งจริง", type: "number" },
+  actual_ship_qty: { label: "ยอดส่งจริง", type: "shipQty" },
   claim_sheet_qty: { label: "ลูกค้าเคลมจำนวน (แผ่นเล็ก)", type: "number" },
   return_to_customer_qty: { label: "คัดส่งคืนลูกค้า", type: "number" },
   return_amount: { label: "จำนวนเงินที่ส่งคืนลูกค้า", type: "number" },
@@ -27,6 +29,7 @@ function emptyToNull(value) {
 function normalizeForCompare(meta, value) {
   if (value == null || value === "") return null;
   if (meta.type === "date") return toDateOnly(value);
+  if (meta.type === "shipQty") return parseShipQty(value);
   if (meta.type === "number") {
     const n = Number(value);
     return Number.isFinite(n) ? n : null;
@@ -57,6 +60,18 @@ export function createRejectService(pool, rejects, activityLogs) {
         if (!Object.prototype.hasOwnProperty.call(payload, key)) continue;
 
         const nextRaw = emptyToNull(payload[key]);
+        if (
+          meta.type === "shipQty" &&
+          nextRaw != null &&
+          parseShipQty(nextRaw) == null
+        ) {
+          const err = new Error(
+            "ยอดส่งจริงต้องเป็นตัวเลข หรือรูปแบบ เช่น 250*3",
+          );
+          err.status = 400;
+          throw err;
+        }
+
         const before = normalizeForCompare(meta, current[key]);
         const after = normalizeForCompare(meta, nextRaw);
 
@@ -80,7 +95,7 @@ export function createRejectService(pool, rejects, activityLogs) {
             : null;
         } else if (meta.type === "date") {
           updateFields[key] = after;
-        } else if (meta.type === "number") {
+        } else if (meta.type === "number" || meta.type === "shipQty") {
           updateFields[key] = after;
         } else {
           updateFields[key] = after;

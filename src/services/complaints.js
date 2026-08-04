@@ -1,5 +1,6 @@
 import { toDateOnly } from "../validators/common.js";
 import { canCsWork, canDepartmentWork, canQaWork, isCmsAdmin } from "../core/authz.js";
+import { normalizePlanForm } from "./plan-form.js";
 
 const TEXT = "text";
 const NUMBER = "number";
@@ -11,12 +12,12 @@ export const COMPLAINT_FIELD_META = {
     problem_name: ["ปัญหา", MASTER],
     ng_qty: ["ของเสีย / NG Qty", NUMBER],
     received_date: ["วันที่รับเรื่อง", DATE],
-    document_accepted: ["เอกสาร (รับ/ไม่รับ)", TEXT],
+    document_accepted: ["เอกสาร Action plan", TEXT],
   },
   qa: {
     reported_by_department_name: ["หน่วยงานที่แจ้งปัญหา", MASTER],
     responsible_department_name: ["หน่วยงานที่รับผิดชอบ", MASTER],
-    document_accepted: ["เอกสาร (รับ/ไม่รับ)", TEXT],
+    document_accepted: ["เอกสาร Action plan", TEXT],
     document_scope: ["เอกสารภายใน/ภายนอก", TEXT],
     document_no: ["เลขที่เอกสาร", TEXT],
   },
@@ -185,8 +186,20 @@ function canWork(status, actor, record) {
   return false;
 }
 
+function displayDocumentAccepted(value) {
+  const code = String(value || "").trim().toUpperCase();
+  if (code === "P") return "รับเอกสาร";
+  if (code === "O") return "ไม่รับเอกสาร";
+  return value == null || value === "" ? "(ว่าง)" : String(value);
+}
+
 function display(value) {
   return value == null || value === "" ? "(ว่าง)" : String(value);
+}
+
+function displayChangeValue(field, value) {
+  if (field === "document_accepted") return displayDocumentAccepted(value);
+  return display(value);
 }
 
 export function createComplaintService(complaints, activityLogs) {
@@ -200,6 +213,68 @@ export function createComplaintService(complaints, activityLogs) {
       }
 
       const status = current.workflow_status || "cs_draft";
+
+      // จัดวางรูปใน PDF — อนุญาตตอนหน่วยงาน/QA Confirm และหลังปิดงาน (QA แก้ได้)
+      if (payload.action === "save_pdf_image_slots") {
+        if (String(current.document_accepted || "").toUpperCase() !== "P") {
+          const error = new Error("จัดวางรูปใน PDF ได้เฉพาะกรณีรับเอกสาร (P)");
+          error.status = 400;
+          throw error;
+        }
+        const allowedStatus =
+          status === "department_action" ||
+          status === "qa_confirm" ||
+          (status === "completed" && isQaUser(actor));
+        if (!allowedStatus) {
+          const error = new Error("สถานะนี้ยังไม่สามารถจัดวางรูปใน PDF ได้");
+          error.status = 400;
+          throw error;
+        }
+        if (status === "department_action" && !isResponsibleDepartmentUser(actor, current) && !isQaUser(actor)) {
+          const error = new Error("ไม่มีสิทธิ์จัดวางรูปใน PDF");
+          error.status = 403;
+          throw error;
+        }
+        if ((status === "qa_confirm" || status === "completed") && !isQaUser(actor) && !isCmsAdmin(actor)) {
+          const error = new Error("เฉพาะ QA ที่จัดวางรูปใน PDF ได้ในขั้นตอนนี้");
+          error.status = 403;
+          throw error;
+        }
+
+        const previous = normalizePlanForm(current.plan_form_json);
+        const next = normalizePlanForm({
+          ...previous,
+          pdfImageSlots: payload.pdf_image_slots || {},
+        });
+        if (JSON.stringify(previous.pdfImageSlots) === JSON.stringify(next.pdfImageSlots)) {
+          return { record: current, changed: false, action: "save_pdf_image_slots" };
+        }
+        await complaints.updatePlanFormJson(id, next);
+        await activityLogs.create({
+          userId: actor.id,
+          username: actor.username,
+          displayName: actor.display_name,
+          department: actor.department,
+          action: "update",
+          entityType: "complaint_record",
+          entityId: id,
+          summary: `จัดวางรูปใน Action Plan PDF ${current.pdr_no || `#${id}`}`,
+          changes: [
+            {
+              field: "pdf_image_slots",
+              label: "ตำแหน่งรูปใน PDF",
+              before: JSON.stringify(previous.pdfImageSlots || {}),
+              after: JSON.stringify(next.pdfImageSlots || {}),
+            },
+          ],
+        });
+        return {
+          record: await complaints.findById(id),
+          changed: true,
+          action: "save_pdf_image_slots",
+        };
+      }
+
       if (status === "completed") {
         const error = new Error("รายการนี้ Confirm และปิดงานแล้ว");
         error.status = 409;
@@ -268,8 +343,8 @@ export function createComplaintService(complaints, activityLogs) {
           summary: `เติมข้อมูลเอกสารอัตโนมัติ Complaint ${current.pdr_no || `#${id}`}`,
           changes: ensureChanges.map((change) => ({
             ...change,
-            before: display(change.before),
-            after: display(change.after),
+            before: displayChangeValue(change.field, change.before),
+            after: displayChangeValue(change.field, change.after),
           })),
         });
         return {
@@ -372,7 +447,11 @@ export function createComplaintService(complaints, activityLogs) {
             before: current.lead_time_days,
             after: meta.lead_time_days,
           },
-        ].filter((change) => display(change.before) !== display(change.after));
+        ].filter(
+          (change) =>
+            displayChangeValue(change.field, change.before) !==
+            displayChangeValue(change.field, change.after),
+        );
 
         await complaints.updateById(id, acceptUpdates);
         await activityLogs.create({
@@ -386,8 +465,8 @@ export function createComplaintService(complaints, activityLogs) {
           summary: `${actor.department || "หน่วยงาน"} รับเรื่อง Complaint ${current.pdr_no || `#${id}`}`,
           changes: acceptChanges.map((change) => ({
             ...change,
-            before: display(change.before),
-            after: display(change.after),
+            before: displayChangeValue(change.field, change.before),
+            after: displayChangeValue(change.field, change.after),
           })),
         });
         return {
@@ -434,6 +513,31 @@ export function createComplaintService(complaints, activityLogs) {
           changes.push({ field: key, label, before, after });
         }
 
+        let planChanged = false;
+        if (
+          String(current.document_accepted || "").toUpperCase() === "P" &&
+          Object.prototype.hasOwnProperty.call(payload, "pdf_image_slots")
+        ) {
+          const previousPlan = normalizePlanForm(current.plan_form_json);
+          const nextPlan = normalizePlanForm({
+            ...previousPlan,
+            pdfImageSlots: payload.pdf_image_slots || {},
+          });
+          if (
+            JSON.stringify(previousPlan.pdfImageSlots) !==
+            JSON.stringify(nextPlan.pdfImageSlots)
+          ) {
+            await complaints.updatePlanFormJson(id, nextPlan);
+            planChanged = true;
+            changes.push({
+              field: "pdf_image_slots",
+              label: "ตำแหน่งรูปใน PDF",
+              before: JSON.stringify(previousPlan.pdfImageSlots || {}),
+              after: JSON.stringify(nextPlan.pdfImageSlots || {}),
+            });
+          }
+        }
+
         if (!isConfirm && changes.length === 0) {
           return { record: current, changed: false, action: "save" };
         }
@@ -452,8 +556,8 @@ export function createComplaintService(complaints, activityLogs) {
             : `QA แก้ไขสาเหตุ/แก้ไข/ป้องกัน Complaint ${current.pdr_no || `#${id}`}`,
           changes: changes.map((change) => ({
             ...change,
-            before: display(change.before),
-            after: display(change.after),
+            before: displayChangeValue(change.field, change.before),
+            after: displayChangeValue(change.field, change.after),
           })),
         });
         return {
@@ -650,8 +754,8 @@ export function createComplaintService(complaints, activityLogs) {
         summary: `${isSubmit ? "ส่งต่อ" : "บันทึก"} Complaint ${current.pdr_no || `#${id}`} (${changes.length} รายการ)`,
         changes: changes.map((change) => ({
           ...change,
-          before: display(change.before),
-          after: display(change.after),
+          before: displayChangeValue(change.field, change.before),
+          after: displayChangeValue(change.field, change.after),
         })),
       });
 

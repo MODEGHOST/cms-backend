@@ -276,6 +276,7 @@ async function main() {
       CREATE TABLE IF NOT EXISTS complaint_attachments (
         id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
         complaint_id BIGINT UNSIGNED NOT NULL,
+        kind ENUM('file', 'signature') NOT NULL DEFAULT 'file',
         original_name VARCHAR(255) NOT NULL,
         stored_name VARCHAR(255) NOT NULL,
         mime_type VARCHAR(120) NULL,
@@ -284,6 +285,7 @@ async function main() {
         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (id),
         KEY idx_complaint_attachments_complaint (complaint_id),
+        KEY idx_complaint_attachments_kind (complaint_id, kind),
         CONSTRAINT fk_complaint_attachments_complaint
           FOREIGN KEY (complaint_id) REFERENCES complaint_records (id)
           ON UPDATE CASCADE ON DELETE CASCADE,
@@ -292,6 +294,20 @@ async function main() {
           ON UPDATE CASCADE ON DELETE SET NULL
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `);
+
+    await ensureColumn(
+      conn,
+      "complaint_attachments",
+      "kind",
+      `ENUM('file', 'signature') NOT NULL DEFAULT 'file' AFTER complaint_id`,
+    );
+
+    await ensureColumn(
+      conn,
+      "complaint_records",
+      "plan_form_json",
+      `JSON NULL AFTER remark`,
+    );
 
     const [[flutes]] = await conn.query("SELECT COUNT(*) AS c FROM flutes");
     const [[complaints]] = await conn.query(

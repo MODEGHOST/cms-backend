@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import XLSX from "xlsx";
 import { createPool } from "../src/core/db.js";
 import { logger } from "../src/core/logger.js";
+import { parseShipQty } from "../src/utils/parse-ship-qty.js";
 
 const DEFAULT_EXCEL = "c:/Users/sa.data02/Downloads/Data reject.xlsx";
 
@@ -17,7 +18,7 @@ function cleanText(value) {
 function parseNumber(value) {
   const text = cleanText(value);
   if (!text) return null;
-  const normalized = text.replace(/,/g, "").replace(/\*/g, "").trim();
+  const normalized = text.replace(/,/g, "").trim();
   if (!normalized || normalized === "-") return null;
   const num = Number(normalized);
   return Number.isFinite(num) ? num : null;
@@ -88,6 +89,13 @@ function pickDate(rawRow, textRow, key) {
   return parseDate(rawRow?.[key]) || parseDate(textRow?.[key]);
 }
 
+async function findMaster(conn, table, name) {
+  const clean = cleanText(name);
+  if (!clean) return null;
+  const [[row]] = await conn.query(`SELECT id FROM ${table} WHERE name = ? LIMIT 1`, [clean]);
+  return row?.id ?? null;
+}
+
 async function upsertMaster(conn, table, name) {
   const clean = cleanText(name);
   if (!clean) return null;
@@ -100,8 +108,22 @@ async function upsertMaster(conn, table, name) {
   return row?.id ?? null;
 }
 
+async function resolveMaster(conn, table, name, { touchMasters }) {
+  return touchMasters ? upsertMaster(conn, table, name) : findMaster(conn, table, name);
+}
+
 async function upsertCompany(conn, name) {
   return upsertMaster(conn, "companies", name);
+}
+
+async function findAlias(conn, companyId, name) {
+  const clean = cleanText(name);
+  if (!clean || !companyId) return null;
+  const [[row]] = await conn.query(
+    `SELECT id FROM customer_aliases WHERE company_id = ? AND name = ? LIMIT 1`,
+    [companyId, clean],
+  );
+  return row?.id ?? null;
 }
 
 async function upsertAlias(conn, companyId, name) {
@@ -118,6 +140,12 @@ async function upsertAlias(conn, companyId, name) {
     [companyId, clean],
   );
   return row?.id ?? null;
+}
+
+async function resolveAlias(conn, companyId, name, { touchMasters }) {
+  return touchMasters
+    ? upsertAlias(conn, companyId, name)
+    : findAlias(conn, companyId, name);
 }
 
 function mapRow(rawRow, textRow) {
@@ -143,7 +171,7 @@ function mapRow(rawRow, textRow) {
     vehicle_plate: cleanText(text["ทะเบียน"]),
     cause: cleanText(text["สาเหตุ"]),
     remark: cleanText(text["หมายเหตุ"]),
-    actual_ship_qty: parseNumber(text[" ยอดส่งจริง "] ?? text["ยอดส่งจริง"]),
+    actual_ship_qty: parseShipQty(text[" ยอดส่งจริง "] ?? text["ยอดส่งจริง"]),
     claim_sheet_qty: parseNumber(text[" ลูกค้าเคลมจำนวน  (แผ่นเล็ก) "] ?? text["ลูกค้าเคลมจำนวน  (แผ่นเล็ก)"]),
     weight_per_sheet: parseNumber(text[" น้ำหนัก/แผ่น "] ?? text["น้ำหนัก/แผ่น"]),
     claim_weight_kg: parseNumber(text[" รวมน้ำหนักเคลม ( KG )/ORDER "] ?? text["รวมน้ำหนักเคลม ( KG )/ORDER"]),
@@ -161,7 +189,10 @@ function mapRow(rawRow, textRow) {
 }
 
 async function main() {
-  const excelPath = resolve(process.argv[2] || DEFAULT_EXCEL);
+  const args = process.argv.slice(2);
+  const touchMasters = !args.includes("--no-touch-masters");
+  const excelArg = args.find((arg) => !arg.startsWith("--"));
+  const excelPath = resolve(excelArg || DEFAULT_EXCEL);
   const buffer = await readFile(excelPath);
   const wb = XLSX.read(buffer, { type: "buffer", cellDates: true });
   const sheet = wb.Sheets[wb.SheetNames[0]];
@@ -172,6 +203,7 @@ async function main() {
   const conn = await pool.getConnection();
   let imported = 0;
   let skipped = 0;
+  let missingMasterLinks = 0;
 
   try {
     await conn.beginTransaction();
@@ -184,13 +216,26 @@ async function main() {
         continue;
       }
 
-      const companyId = await upsertCompany(conn, row.companyName);
-      const aliasId = await upsertAlias(conn, companyId, row.aliasName);
-      const departmentId = await upsertMaster(conn, "departments", row.departmentName);
-      const machineId = await upsertMaster(conn, "machines", row.machineName);
-      const problemId = await upsertMaster(conn, "problems", row.problemName);
-      if (row.shift === "A" || row.shift === "B") {
+      const companyId = await resolveMaster(conn, "companies", row.companyName, { touchMasters });
+      const aliasId = await resolveAlias(conn, companyId, row.aliasName, { touchMasters });
+      const departmentId = await resolveMaster(conn, "departments", row.departmentName, {
+        touchMasters,
+      });
+      const machineId = await resolveMaster(conn, "machines", row.machineName, { touchMasters });
+      const problemId = await resolveMaster(conn, "problems", row.problemName, { touchMasters });
+      if (touchMasters && (row.shift === "A" || row.shift === "B")) {
         await upsertMaster(conn, "shifts", row.shift);
+      }
+
+      if (
+        !touchMasters &&
+        ((row.companyName && !companyId) ||
+          (row.aliasName && companyId && !aliasId) ||
+          (row.departmentName && !departmentId) ||
+          (row.machineName && !machineId) ||
+          (row.problemName && !problemId))
+      ) {
+        missingMasterLinks += 1;
       }
 
       await conn.query(
@@ -215,7 +260,9 @@ async function main() {
     }
 
     await conn.commit();
-    logger.info(`Import done: imported=${imported} skipped=${skipped} file=${excelPath}`);
+    logger.info(
+      `Import done: imported=${imported} skipped=${skipped} missingMasterLinks=${missingMasterLinks} touchMasters=${touchMasters} file=${excelPath}`,
+    );
   } catch (err) {
     await conn.rollback();
     throw err;
