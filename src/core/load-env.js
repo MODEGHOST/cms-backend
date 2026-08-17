@@ -16,7 +16,8 @@ function applyEnvFile(path, { override = false } = {}) {
 export function loadEnv(rootDir = packageRoot) {
   const localPath = resolve(rootDir, ".env");
   const productionPath = resolve(rootDir, ".env.production");
-  const forceProduction = process.env.USE_PRODUCTION_ENV === "1";
+  const forceProduction =
+    process.env.USE_PRODUCTION_ENV === "1" || process.env.NODE_ENV === "production";
 
   if (forceProduction && existsSync(productionPath)) {
     applyEnvFile(productionPath, { override: true });

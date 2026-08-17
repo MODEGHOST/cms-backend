@@ -169,6 +169,7 @@ CREATE TABLE IF NOT EXISTS reject_records (
   customer_alias_id BIGINT UNSIGNED NULL,
   department_id BIGINT UNSIGNED NULL,
   machine_id BIGINT UNSIGNED NULL,
+  flute_id BIGINT UNSIGNED NULL,
   problem_id BIGINT UNSIGNED NULL,
 
   -- Dates (Excel order)
@@ -184,11 +185,27 @@ CREATE TABLE IF NOT EXISTS reject_records (
   sale_order_no VARCHAR(80) NULL,
   order_qty DECIMAL(14, 2) NULL,
   size VARCHAR(255) NULL,
+  -- Tag snapshot จาก ERP GET /api/pdr (ไม่เขียนกลับ ERP)
+  cut_qty INT NULL,
+  item_code VARCHAR(80) NULL,
+  big_sheet_qty DECIMAL(14, 2) NULL,
+  big_sheet_size VARCHAR(40) NULL,
+  small_sheet_size VARCHAR(40) NULL,
   shift VARCHAR(20) NULL,
   job_type VARCHAR(40) NULL,
   vehicle_plate VARCHAR(80) NULL,
   cause VARCHAR(500) NULL,
   remark TEXT NULL,
+  -- Memo / Tag PDF overrides (editable before download)
+  memo_lot_no VARCHAR(80) NULL,
+  pallet_count INT NULL,
+  pallet_lines JSON NULL,
+  repair_with_qty DECIMAL(14, 2) NULL,
+  memo_customer_return_qty DECIMAL(14, 2) NULL,
+  tag_ship_date DATE NULL,
+  -- Origin: import | complaint | api (null = legacy Excel import)
+  source VARCHAR(20) NULL,
+  source_complaint_id BIGINT UNSIGNED NULL,
 
   -- Claim amounts
   actual_ship_qty DECIMAL(14, 2) NULL,
@@ -218,8 +235,14 @@ CREATE TABLE IF NOT EXISTS reject_records (
   KEY idx_reject_company (company_id),
   KEY idx_reject_problem (problem_id),
   KEY idx_reject_machine (machine_id),
+  KEY idx_reject_flute (flute_id),
   KEY idx_reject_department (department_id),
   KEY idx_reject_invoice (invoice_no),
+  KEY idx_reject_source (source),
+  KEY idx_reject_source_complaint (source_complaint_id),
+  KEY idx_reject_pdr (pdr_no),
+  KEY idx_reject_created (created_at),
+  KEY idx_reject_job_type (job_type),
 
   CONSTRAINT fk_reject_company
     FOREIGN KEY (company_id) REFERENCES companies (id)
@@ -233,6 +256,9 @@ CREATE TABLE IF NOT EXISTS reject_records (
   CONSTRAINT fk_reject_machine
     FOREIGN KEY (machine_id) REFERENCES machines (id)
     ON UPDATE CASCADE ON DELETE SET NULL,
+  CONSTRAINT fk_reject_flute
+    FOREIGN KEY (flute_id) REFERENCES flutes (id)
+    ON UPDATE CASCADE ON DELETE SET NULL,
   CONSTRAINT fk_reject_problem
     FOREIGN KEY (problem_id) REFERENCES problems (id)
     ON UPDATE CASCADE ON DELETE SET NULL,
@@ -242,6 +268,20 @@ CREATE TABLE IF NOT EXISTS reject_records (
   CONSTRAINT fk_reject_updated_by
     FOREIGN KEY (updated_by) REFERENCES users (id)
     ON UPDATE CASCADE ON DELETE SET NULL
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS reject_record_problems (
+  reject_id BIGINT UNSIGNED NOT NULL,
+  problem_id BIGINT UNSIGNED NOT NULL,
+  sort_order INT NOT NULL DEFAULT 0,
+  PRIMARY KEY (reject_id, problem_id),
+  KEY idx_rrp_problem (problem_id),
+  CONSTRAINT fk_rrp_reject
+    FOREIGN KEY (reject_id) REFERENCES reject_records (id)
+    ON UPDATE CASCADE ON DELETE CASCADE,
+  CONSTRAINT fk_rrp_problem
+    FOREIGN KEY (problem_id) REFERENCES problems (id)
+    ON UPDATE CASCADE ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
 -- ---------- Complaint transactions (1 row = 1 Excel row in ทะเบียนข้อร้องเรียน) ----------
@@ -282,12 +322,16 @@ CREATE TABLE IF NOT EXISTS complaint_records (
   -- Qty / classification
   demand_qty DECIMAL(14, 2) NULL,
   ng_qty DECIMAL(14, 2) NULL,
+  -- หมายเหตุกระบวนการของ CS (ไม่ใช่หมายเหตุเอกสาร Action plan)
+  cs_remark TEXT NULL,
   -- GRADE: A / B / C / D / NEW / X
   grade VARCHAR(10) NULL,
   sale_cs_staff VARCHAR(120) NULL,
 
   -- Document workflow (เอกสาร รับ/ไม่รับ = P/O, ภายใน/ภายนอก)
   document_accepted ENUM('P', 'O') NULL,
+  document_accepted_at DATETIME NULL,
+  document_deadline_warned_on DATE NULL,
   document_scope ENUM('ภายใน', 'ภายนอก') NULL,
   document_no VARCHAR(80) NULL,
   doc_forward_date DATE NULL,
@@ -339,6 +383,8 @@ CREATE TABLE IF NOT EXISTS complaint_records (
   KEY idx_complaint_pdr (pdr_no),
   KEY idx_complaint_document_no (document_no),
   KEY idx_complaint_grade (grade),
+  KEY idx_complaint_workflow (workflow_status),
+  KEY idx_complaint_received_workflow (received_date, workflow_status),
 
   CONSTRAINT fk_complaint_company
     FOREIGN KEY (company_id) REFERENCES companies (id)
@@ -400,6 +446,35 @@ CREATE TABLE IF NOT EXISTS complaint_attachments (
   CONSTRAINT fk_complaint_attachments_uploaded_by
     FOREIGN KEY (uploaded_by) REFERENCES users (id)
     ON UPDATE CASCADE ON DELETE SET NULL
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS complaint_record_problems (
+  complaint_id BIGINT UNSIGNED NOT NULL,
+  problem_id BIGINT UNSIGNED NOT NULL,
+  sort_order INT NOT NULL DEFAULT 0,
+  PRIMARY KEY (complaint_id, problem_id),
+  KEY idx_crp_problem (problem_id),
+  CONSTRAINT fk_crp_complaint
+    FOREIGN KEY (complaint_id) REFERENCES complaint_records (id)
+    ON UPDATE CASCADE ON DELETE CASCADE,
+  CONSTRAINT fk_crp_problem
+    FOREIGN KEY (problem_id) REFERENCES problems (id)
+    ON UPDATE CASCADE ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+-- ---------- Daily unique prod orders (ERP shipment snapshot) ----------
+-- Types: PDC, PDD, PDF, PDO, PDP, PDR, PDS, PDW, PDZ
+-- Denominator for Reject % / Complaint %. Job at 02:00 upserts last 3 days → yesterday.
+-- Dashboard reads this table only — never hits ERP on page load.
+-- แถวรวม = ทุกประเภท; แถว PDR/PDW ยังแยกเหมือนเดิม
+CREATE TABLE IF NOT EXISTS order_daily_count (
+  order_no VARCHAR(80) NOT NULL,
+  order_type ENUM('PDC', 'PDD', 'PDF', 'PDO', 'PDP', 'PDR', 'PDS', 'PDW', 'PDZ') NOT NULL,
+  shipment_date DATE NOT NULL,
+  synced_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (order_no),
+  KEY idx_order_daily_shipment (shipment_date),
+  KEY idx_order_daily_type_date (order_type, shipment_date)
 ) ENGINE=InnoDB;
 
 -- ---------- Activity logs (who filled / updated what) ----------

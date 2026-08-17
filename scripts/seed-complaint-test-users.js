@@ -9,14 +9,14 @@ import { createUserRepository } from "../src/repositories/users.js";
 
 const PASSWORD = "Test1234!";
 const USERS = [
-  { username: "cs_test", displayName: "ทดสอบ CS", department: "CS" },
+  { username: "cs_test", displayName: "ทดสอบ CS", department: "MKT" },
   { username: "qa_test", displayName: "ทดสอบ QA", department: "QA" },
   { username: "pd_test", displayName: "ทดสอบ PD", department: "PD" },
   { username: "lts_test", displayName: "ทดสอบ LTS", department: "LTS" },
   {
     username: "production_test",
     displayName: "ทดสอบ Production",
-    department: "Production",
+    department: "PD",
   },
 ];
 

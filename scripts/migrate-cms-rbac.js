@@ -9,11 +9,10 @@ import { ensureCmsRbac } from "../src/core/ensure-cms-rbac.js";
 
 function mapLegacyRole({ legacyRole, department }) {
   if (legacyRole === "admin") return "admin";
-  const dept = String(department || "").trim().toUpperCase();
-  if (dept === "CS" || dept === "CUSTOMER SERVICE") return "cs";
-  if (dept === "QA") return "qa";
-  if (dept === "QC") return "qc";
-  if (dept) return "department";
+  if (legacyRole === "developer") return "developer";
+  if (legacyRole === "viewer") return "viewer";
+  // staff / old ENUM staff / any workflow dept → staff (workflow from department)
+  if (department || legacyRole === "staff") return "staff";
   return "viewer";
 }
 

@@ -51,10 +51,13 @@ CREATE TABLE IF NOT EXISTS complaint_records (
 
   demand_qty DECIMAL(14, 2) NULL,
   ng_qty DECIMAL(14, 2) NULL,
+  cs_remark TEXT NULL,
   grade VARCHAR(10) NULL,
   sale_cs_staff VARCHAR(120) NULL,
 
   document_accepted ENUM('P', 'O') NULL,
+  document_accepted_at DATETIME NULL,
+  document_deadline_warned_on DATE NULL,
   document_scope ENUM('ภายใน', 'ภายนอก') NULL,
   document_no VARCHAR(80) NULL,
   doc_forward_date DATE NULL,
@@ -97,6 +100,8 @@ CREATE TABLE IF NOT EXISTS complaint_records (
   KEY idx_complaint_pdr (pdr_no),
   KEY idx_complaint_document_no (document_no),
   KEY idx_complaint_grade (grade),
+  KEY idx_complaint_workflow (workflow_status),
+  KEY idx_complaint_received_workflow (received_date, workflow_status),
 
   CONSTRAINT fk_complaint_company
     FOREIGN KEY (company_id) REFERENCES companies (id)
@@ -158,4 +163,18 @@ CREATE TABLE IF NOT EXISTS complaint_attachments (
   CONSTRAINT fk_complaint_attachments_uploaded_by
     FOREIGN KEY (uploaded_by) REFERENCES users (id)
     ON UPDATE CASCADE ON DELETE SET NULL
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS complaint_record_problems (
+  complaint_id BIGINT UNSIGNED NOT NULL,
+  problem_id BIGINT UNSIGNED NOT NULL,
+  sort_order INT NOT NULL DEFAULT 0,
+  PRIMARY KEY (complaint_id, problem_id),
+  KEY idx_crp_problem (problem_id),
+  CONSTRAINT fk_crp_complaint
+    FOREIGN KEY (complaint_id) REFERENCES complaint_records (id)
+    ON UPDATE CASCADE ON DELETE CASCADE,
+  CONSTRAINT fk_crp_problem
+    FOREIGN KEY (problem_id) REFERENCES problems (id)
+    ON UPDATE CASCADE ON DELETE CASCADE
 ) ENGINE=InnoDB;

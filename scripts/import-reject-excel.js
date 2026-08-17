@@ -5,6 +5,7 @@ import XLSX from "xlsx";
 import { createPool } from "../src/core/db.js";
 import { logger } from "../src/core/logger.js";
 import { parseShipQty } from "../src/utils/parse-ship-qty.js";
+import { canonicalizeDepartmentName, isCanonicalDepartment } from "../src/utils/department-map.js";
 
 const DEFAULT_EXCEL = "c:/Users/sa.data02/Downloads/Data reject.xlsx";
 
@@ -90,15 +91,56 @@ function pickDate(rawRow, textRow, key) {
 }
 
 async function findMaster(conn, table, name) {
-  const clean = cleanText(name);
+  const clean =
+    table === "departments" ? canonicalizeDepartmentName(name) : cleanText(name);
   if (!clean) return null;
+  if (table === "departments") {
+    const [[row]] = await conn.query(
+      `SELECT id FROM departments
+       WHERE LOWER(name) = LOWER(?)
+       ORDER BY is_active DESC, id ASC
+       LIMIT 1`,
+      [clean],
+    );
+    return row?.id ?? null;
+  }
   const [[row]] = await conn.query(`SELECT id FROM ${table} WHERE name = ? LIMIT 1`, [clean]);
   return row?.id ?? null;
 }
 
 async function upsertMaster(conn, table, name) {
-  const clean = cleanText(name);
+  const clean =
+    table === "departments" ? canonicalizeDepartmentName(name) : cleanText(name);
   if (!clean) return null;
+  if (table === "departments") {
+    const [[existing]] = await conn.query(
+      `SELECT id FROM departments
+       WHERE LOWER(name) = LOWER(?)
+       ORDER BY is_active DESC, id ASC
+       LIMIT 1`,
+      [clean],
+    );
+    if (existing?.id) {
+      await conn.query(`UPDATE departments SET is_active = 1, name = ? WHERE id = ?`, [
+        clean,
+        existing.id,
+      ]);
+      return existing.id;
+    }
+    // ห้ามสร้างแผนกนอก Master จาก Excel เก่า
+    if (!isCanonicalDepartment(clean)) {
+      logger.warn(`Skip unknown department from Excel: ${JSON.stringify(name)} → ${JSON.stringify(clean)}`);
+      return null;
+    }
+    await conn.query(`INSERT INTO departments (name, is_active) VALUES (?, 1)`, [
+      clean,
+    ]);
+    const [[row]] = await conn.query(
+      `SELECT id FROM departments WHERE LOWER(name) = LOWER(?) LIMIT 1`,
+      [clean],
+    );
+    return row?.id ?? null;
+  }
   await conn.query(
     `INSERT INTO ${table} (name, is_active) VALUES (?, 1)
      ON DUPLICATE KEY UPDATE is_active = VALUES(is_active)`,
@@ -173,8 +215,12 @@ function mapRow(rawRow, textRow) {
     remark: cleanText(text["หมายเหตุ"]),
     actual_ship_qty: parseShipQty(text[" ยอดส่งจริง "] ?? text["ยอดส่งจริง"]),
     claim_sheet_qty: parseNumber(text[" ลูกค้าเคลมจำนวน  (แผ่นเล็ก) "] ?? text["ลูกค้าเคลมจำนวน  (แผ่นเล็ก)"]),
-    weight_per_sheet: parseNumber(text[" น้ำหนัก/แผ่น "] ?? text["น้ำหนัก/แผ่น"]),
-    claim_weight_kg: parseNumber(text[" รวมน้ำหนักเคลม ( KG )/ORDER "] ?? text["รวมน้ำหนักเคลม ( KG )/ORDER"]),
+    weight_per_sheet: parseNumber(text[" น้ำหนัก/แผ่น "] ?? text["น้ำหนัก/แผ่น"] ?? text["น้ำหนัก/แผ่น"]),
+    claim_weight_kg: parseNumber(
+      text[" รวมน้ำหนักเคลม ( KG )/ORDER "] ??
+        text["รวมน้ำหนักเคลม ( KG )/ORDER"] ??
+        text["รวมน้ำหนักเคลม ( KG )/ORDER"],
+    ),
     price_per_sheet: parseNumber(text[" ราคา/แผ่นเล็ก "] ?? text["ราคา/แผ่นเล็ก"]),
     claim_amount: parseNumber(text[" จำนวนเงิน "] ?? text["จำนวนเงิน"]),
     sort_claim_sup_qty: parseNumber(text["คัดเคลม SUP"]),
@@ -188,6 +234,64 @@ function mapRow(rawRow, textRow) {
   };
 }
 
+/** Find header row (has PDR + ปัญหา) then build object rows — supports title row above headers. */
+function sheetToKeyedRows(sheet) {
+  const textMatrix = XLSX.utils.sheet_to_json(sheet, {
+    header: 1,
+    defval: null,
+    raw: false,
+  });
+  const rawMatrix = XLSX.utils.sheet_to_json(sheet, {
+    header: 1,
+    defval: null,
+    raw: true,
+  });
+
+  let headerIdx = -1;
+  for (let i = 0; i < Math.min(textMatrix.length, 20); i += 1) {
+    const cells = (textMatrix[i] || []).map((v) =>
+      String(v ?? "")
+        .replace(/\s+/g, " ")
+        .trim(),
+    );
+    const hasPdr = cells.some((c) => c === "PDR");
+    const hasProblem = cells.some((c) => c === "ปัญหา");
+    if (hasPdr && hasProblem) {
+      headerIdx = i;
+      break;
+    }
+  }
+
+  if (headerIdx < 0) {
+    // Fallback: first row as headers (legacy flat files)
+    const textRows = XLSX.utils.sheet_to_json(sheet, { defval: null, raw: false });
+    const rawRows = XLSX.utils.sheet_to_json(sheet, { defval: null, raw: true });
+    return { textRows, rawRows };
+  }
+
+  const headers = (textMatrix[headerIdx] || []).map((v) =>
+    v == null ? "" : String(v),
+  );
+  const textRows = [];
+  const rawRows = [];
+  for (let r = headerIdx + 1; r < textMatrix.length; r += 1) {
+    const textLine = textMatrix[r] || [];
+    const rawLine = rawMatrix[r] || textLine;
+    if (!textLine.some((v) => cleanText(v))) continue;
+    const textObj = {};
+    const rawObj = {};
+    for (let c = 0; c < headers.length; c += 1) {
+      const key = headers[c];
+      if (!key) continue;
+      textObj[key] = textLine[c] ?? null;
+      rawObj[key] = rawLine[c] ?? null;
+    }
+    textRows.push(textObj);
+    rawRows.push(rawObj);
+  }
+  return { textRows, rawRows, headerIdx };
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const touchMasters = !args.includes("--no-touch-masters");
@@ -196,8 +300,10 @@ async function main() {
   const buffer = await readFile(excelPath);
   const wb = XLSX.read(buffer, { type: "buffer", cellDates: true });
   const sheet = wb.Sheets[wb.SheetNames[0]];
-  const textRows = XLSX.utils.sheet_to_json(sheet, { defval: null, raw: false });
-  const rawRows = XLSX.utils.sheet_to_json(sheet, { defval: null, raw: true });
+  const { textRows, rawRows, headerIdx } = sheetToKeyedRows(sheet);
+  if (headerIdx != null) {
+    logger.info(`Reject header row index=${headerIdx} dataRows=${textRows.length}`);
+  }
 
   const pool = createPool();
   const conn = await pool.getConnection();

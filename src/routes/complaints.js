@@ -6,8 +6,10 @@ import { fileURLToPath } from "node:url";
 import multer from "multer";
 import { createActivityLogRepository } from "../repositories/activity-logs.js";
 import { createComplaintRepository } from "../repositories/complaints.js";
+import { createRejectRepository } from "../repositories/rejects.js";
 import { createUserRepository } from "../repositories/users.js";
 import { createComplaintService } from "../services/complaints.js";
+import { createRejectService } from "../services/rejects.js";
 import {
   buildComplaintInboxFilter,
   COMPLAINT_WORKFLOW_LABELS,
@@ -22,12 +24,23 @@ import {
   PLAN_APPROVAL_ROLES,
   PLAN_CONTRIBUTOR_MAX,
 } from "../services/plan-form.js";
+import { listPlanSigners, getPlanSignerSignaturePath } from "../services/plan-signers.js";
 import { paginatedJson, parsePagination } from "../validators/common.js";
+import { mergeRelatedRejects, parseProblemNames } from "../utils/problem-names.js";
+import { createTelegramNotifier } from "../services/telegram-notifier.js";
+import { config as appConfig } from "../core/config.js";
+import { logger } from "../core/logger.js";
+import { createFromErpService } from "../services/from-erp.js";
+import { canCsWork } from "../core/authz.js";
 
 const uploadsDirectory = resolve(
   fileURLToPath(new URL("../../storage/uploads/complaints/", import.meta.url)),
 );
 mkdirSync(uploadsDirectory, { recursive: true });
+
+const FORM_OPTIONS_TTL_MS = 5 * 60 * 1000;
+let formOptionsCache = null;
+let formOptionsCachedAt = 0;
 
 const upload = multer({
   storage: multer.diskStorage({
@@ -42,19 +55,54 @@ const upload = multer({
   },
 });
 
-export function registerComplaintRoutes(app, { pool, wrap, requireAuth }) {
+export function registerComplaintRoutes(app, { pool, wrap, requireAuth, telegram }) {
   const complaints = createComplaintRepository(pool);
   const users = createUserRepository(pool);
-  const service = createComplaintService(
+  const activityLogs = createActivityLogRepository(pool);
+  const service = createComplaintService(complaints, activityLogs);
+  const rejects = createRejectRepository(pool);
+  const fromErp = createFromErpService({
+    config: appConfig,
     complaints,
-    createActivityLogRepository(pool),
+    rejects,
+    activityLogs,
+  });
+  const rejectService = createRejectService(
+    pool,
+    rejects,
+    activityLogs,
   );
+
+  const notifier = telegram
+    ? createTelegramNotifier({ telegram, users, config: appConfig, logger })
+    : null;
+
+  function notifyTelegram(promise, event, meta = {}) {
+    promise.catch((err) => {
+      logger.warn("telegram_notify_failed", {
+        event,
+        error: err?.message || String(err),
+        ...meta,
+      });
+    });
+  }
 
   async function withAttachments(record) {
     if (!record) return record;
+    const relatedRows = await rejects.findRelatedForComplaint(record);
+    const related = mergeRelatedRejects(relatedRows);
     return {
       ...record,
       attachments: await complaints.listAttachments(record.id),
+      related_reject: related
+        ? {
+            id: related.id,
+            pdr_no: related.pdr_no,
+            problems: related.problems || [],
+            problem_names: related.problem_names || [],
+            problem_name: related.problem_name || null,
+          }
+        : null,
     };
   }
 
@@ -74,7 +122,19 @@ export function registerComplaintRoutes(app, { pool, wrap, requireAuth }) {
   }
 
   async function resolveActor(req) {
-    const dbUser = await users.findById(req.user.sub);
+    // requireAuth already hydrated roles/permissions — avoid a second DB round-trip.
+    if (req.user?.id || req.user?.sub) {
+      return {
+        id: req.user.id || req.user.sub,
+        username: req.user.username,
+        display_name: req.user.display_name,
+        role: req.user.role,
+        roles: req.user.roles || [],
+        permissions: req.user.permissions || [],
+        department: req.user.department,
+      };
+    }
+    const dbUser = await users.findById(req.user?.sub);
     if (!dbUser) {
       const error = new Error("ไม่พบบัญชีผู้ใช้");
       error.status = 401;
@@ -162,6 +222,67 @@ export function registerComplaintRoutes(app, { pool, wrap, requireAuth }) {
     }),
   );
 
+  /**
+   * INSERT Complaint จากข้อมูลในฟอร์ม (หลัง Search แล้ว) — ไม่เรียก ERP ซ้ำ
+   */
+  app.post(
+    "/api/complaints/from-draft",
+    requireAuth,
+    wrap(async (req, res) => {
+      const actor = await resolveActor(req);
+      if (!canCsWork(actor)) {
+        const error = new Error("ไม่มีสิทธิ์สร้าง Complaint (ต้องมี complaints.cs)");
+        error.status = 403;
+        throw error;
+      }
+      const result = await fromErp.createComplaintFromDraft(req.body || {}, actor);
+      const data = await Promise.all((result.data || []).map(withAttachments));
+      res.status(result.created ? 201 : 200).json({
+        ...result,
+        data,
+        total: data.length,
+      });
+    }),
+  );
+
+  /**
+   * INSERT Complaint โดย GET ERP ใหม่ (fallback) — ไม่เขียนกลับ ERP
+   */
+  app.post(
+    "/api/complaints/from-erp",
+    requireAuth,
+    wrap(async (req, res) => {
+      const pdrNo = String(req.body?.pdr_no || req.query.pdr_no || "").trim();
+      const actor = await resolveActor(req);
+      if (pdrNo) {
+        const existing = await complaints.findByPdr(pdrNo);
+        if (existing.length) {
+          const data = await Promise.all(existing.map(withAttachments));
+          res.json({
+            data,
+            total: data.length,
+            pdr_no: pdrNo,
+            created: false,
+            from_erp: false,
+          });
+          return;
+        }
+      }
+      if (!canCsWork(actor)) {
+        const error = new Error("ไม่มีสิทธิ์สร้าง Complaint (ต้องมี complaints.cs)");
+        error.status = 403;
+        throw error;
+      }
+      const result = await fromErp.findOrCreateComplaint(pdrNo, actor);
+      const data = await Promise.all((result.data || []).map(withAttachments));
+      res.status(result.created ? 201 : 200).json({
+        ...result,
+        data,
+        total: data.length,
+      });
+    }),
+  );
+
   app.post(
     "/api/complaints/:id/cs-submit",
     requireAuth,
@@ -175,30 +296,30 @@ export function registerComplaintRoutes(app, { pool, wrap, requireAuth }) {
           error.status = 400;
           throw error;
         }
-        const dbUser = await users.findById(req.user.sub);
-        if (!dbUser) {
-          const error = new Error("ไม่พบบัญชีผู้ใช้");
-          error.status = 401;
-          throw error;
-        }
+        const dbUser = await resolveActor(req);
+        const rawAction = String(req.body?.action || "").trim();
+        const action = rawAction === "save" ? "save" : "submit";
+        const actor = {
+          id: dbUser.id,
+          username: dbUser.username,
+          display_name: dbUser.display_name,
+          role: dbUser.role,
+          roles: dbUser.roles || [],
+          permissions: dbUser.permissions || [],
+          department: dbUser.department,
+        };
         const result = await service.updateCurrentStep(
           id,
           {
             problem_name: req.body?.problem_name,
+            problem_names: parseProblemNames(req.body),
             ng_qty: req.body?.ng_qty,
+            cs_remark: req.body?.cs_remark,
             received_date: req.body?.received_date,
             document_accepted: req.body?.document_accepted,
-            action: req.body?.action === "save" ? "save" : "submit",
+            action,
           },
-          {
-            id: dbUser.id,
-            username: dbUser.username,
-            display_name: dbUser.display_name,
-            role: dbUser.role,
-            roles: dbUser.roles || [],
-            permissions: dbUser.permissions || [],
-            department: dbUser.department,
-          },
+          actor,
         );
         if (files.length) {
           await complaints.createAttachments(id, files, dbUser.id, "file");
@@ -212,11 +333,181 @@ export function registerComplaintRoutes(app, { pool, wrap, requireAuth }) {
             unlink(resolve(uploadsDirectory, attachment.stored_name)).catch(() => {}),
           ),
         );
+        const updatedRecord = await complaints.findById(id);
+
+        let rejectInfo = null;
+        let rejectRecord = null;
+        const repairFlag = String(req.body?.repair_flag || "").trim().toLowerCase();
+        if (action === "submit" && repairFlag === "repair") {
+          try {
+            // ส่งคิวให้ QC เท่านั้น — ไม่ GET ERP ตอนแปลง (QC ค่อยดึงตอนเปิดฟอร์ม)
+            const rejectResult = await rejectService.createStubFromComplaint(
+              updatedRecord,
+              actor,
+            );
+            rejectRecord = rejectResult.record || null;
+            rejectInfo = {
+              id: rejectRecord?.id || null,
+              pdr_no: rejectRecord?.pdr_no || updatedRecord.pdr_no || null,
+              created: Boolean(rejectResult.created),
+            };
+          } catch (convertError) {
+            logger.warn("reject_from_complaint_failed", {
+              complaintId: updatedRecord.id,
+              pdr_no: updatedRecord.pdr_no,
+              error: convertError?.message || String(convertError),
+            });
+            rejectInfo = {
+              id: null,
+              pdr_no: updatedRecord.pdr_no || null,
+              created: false,
+              error:
+                convertError?.message ||
+                "สร้างรายการ Reject ไม่สำเร็จ (Complaint บันทึกแล้ว)",
+            };
+          }
+        }
+
         res.json({
-          data: await withAttachments(await complaints.findById(id)),
+          data: await withAttachments(updatedRecord),
           changed: result.changed || files.length > 0 || removed.length > 0,
           action: result.action,
+          reject: rejectInfo,
         });
+
+        if (notifier && result.action === "submit" && updatedRecord.workflow_status !== "cs_draft") {
+          notifyTelegram(
+            notifier.onStatusChange(updatedRecord, updatedRecord.workflow_status, actor),
+            "complaint_status_change",
+            { complaintId: updatedRecord.id, status: updatedRecord.workflow_status },
+          );
+        }
+        if (notifier && rejectInfo?.created && rejectRecord) {
+          notifyTelegram(
+            notifier.onRejectCreated(rejectRecord, actor),
+            "reject_created",
+            { rejectId: rejectRecord.id },
+          );
+        }
+      } catch (error) {
+        await Promise.all(
+          files.map((file) => unlink(file.path).catch(() => {})),
+        );
+        throw error;
+      }
+    }),
+  );
+
+  app.post(
+    "/api/complaints/:id/qa-submit",
+    requireAuth,
+    upload.array("files", 10),
+    wrap(async (req, res) => {
+      const id = Number(req.params.id);
+      const files = req.files || [];
+      try {
+        if (!Number.isInteger(id) || id <= 0) {
+          const error = new Error("รหัสรายการไม่ถูกต้อง");
+          error.status = 400;
+          throw error;
+        }
+        const actor = await resolveActor(req);
+        const current = await complaints.findById(id);
+        if (!current) {
+          const error = new Error("ไม่พบรายการ Complaint");
+          error.status = 404;
+          throw error;
+        }
+        const prevStatus = current.workflow_status;
+        const rawAction = String(req.body?.action || "").trim();
+        const action = rawAction === "save" ? "save" : "submit";
+        const result = await service.updateCurrentStep(
+          id,
+          {
+            problem_name: req.body?.problem_name,
+            problem_names: parseProblemNames(req.body),
+            ng_qty: req.body?.ng_qty,
+            cs_remark: req.body?.cs_remark,
+            reported_by_department_name: req.body?.reported_by_department_name,
+            responsible_department_name: req.body?.responsible_department_name,
+            document_accepted: req.body?.document_accepted,
+            document_scope: req.body?.document_scope,
+            document_no: req.body?.document_no,
+            action,
+          },
+          actor,
+        );
+        if (files.length) {
+          await complaints.createAttachments(id, files, actor.id, "file");
+        }
+        const removed = await complaints.deleteAttachments(
+          id,
+          parseAttachmentIds(req.body?.remove_attachment_ids),
+        );
+        await Promise.all(
+          removed.map((attachment) =>
+            unlink(resolve(uploadsDirectory, attachment.stored_name)).catch(() => {}),
+          ),
+        );
+        const updatedRecord = await complaints.findById(id);
+
+        let rejectInfo = null;
+        let rejectRecord = null;
+        const repairFlag = String(req.body?.repair_flag || "").trim().toLowerCase();
+        if (repairFlag === "repair") {
+          try {
+            const rejectResult = await rejectService.createStubFromComplaint(
+              updatedRecord,
+              actor,
+            );
+            rejectRecord = rejectResult.record || null;
+            rejectInfo = {
+              id: rejectRecord?.id || null,
+              pdr_no: rejectRecord?.pdr_no || updatedRecord.pdr_no || null,
+              created: Boolean(rejectResult.created),
+            };
+          } catch (convertError) {
+            logger.warn("reject_from_complaint_failed", {
+              complaintId: updatedRecord.id,
+              pdr_no: updatedRecord.pdr_no,
+              error: convertError?.message || String(convertError),
+            });
+            rejectInfo = {
+              id: null,
+              pdr_no: updatedRecord.pdr_no || null,
+              created: false,
+              error:
+                convertError?.message ||
+                "สร้างรายการ Reject ไม่สำเร็จ (Complaint บันทึกแล้ว)",
+            };
+          }
+        }
+
+        res.json({
+          data: await withAttachments(updatedRecord),
+          changed: result.changed || files.length > 0 || removed.length > 0,
+          action: result.action,
+          reject: rejectInfo,
+        });
+
+        if (notifier && updatedRecord.workflow_status !== prevStatus) {
+          notifyTelegram(
+            notifier.onStatusChange(
+              updatedRecord,
+              updatedRecord.workflow_status,
+              actor,
+            ),
+            "complaint_status_change",
+            { complaintId: updatedRecord.id, status: updatedRecord.workflow_status },
+          );
+        }
+        if (notifier && rejectInfo?.created && rejectRecord) {
+          notifyTelegram(
+            notifier.onRejectCreated(rejectRecord, actor),
+            "reject_created",
+            { rejectId: rejectRecord.id },
+          );
+        }
       } catch (error) {
         await Promise.all(
           files.map((file) => unlink(file.path).catch(() => {})),
@@ -267,12 +558,7 @@ export function registerComplaintRoutes(app, { pool, wrap, requireAuth }) {
           error.status = 400;
           throw error;
         }
-        const dbUser = await users.findById(req.user.sub);
-        if (!dbUser) {
-          const error = new Error("ไม่พบบัญชีผู้ใช้");
-          error.status = 401;
-          throw error;
-        }
+        const dbUser = await resolveActor(req);
         const current = await complaints.findById(id);
         if (!current) {
           const error = new Error("ไม่พบรายการ Complaint");
@@ -280,6 +566,16 @@ export function registerComplaintRoutes(app, { pool, wrap, requireAuth }) {
           throw error;
         }
 
+        const prevStatus = current.workflow_status;
+        const actor = {
+          id: dbUser.id,
+          username: dbUser.username,
+          display_name: dbUser.display_name,
+          role: dbUser.role,
+          roles: dbUser.roles || [],
+          permissions: dbUser.permissions || [],
+          department: dbUser.department,
+        };
         const result = await service.updateCurrentStep(
           id,
           {
@@ -288,20 +584,23 @@ export function registerComplaintRoutes(app, { pool, wrap, requireAuth }) {
             prevention: req.body?.prevention,
             completed_date: req.body?.completed_date,
             remark: req.body?.remark,
-            action: req.body?.action === "save" ? "save" : "submit",
+            action:
+              current.workflow_status === "qa_confirm"
+                ? "dept_update"
+                : req.body?.action === "save"
+                  ? "save"
+                  : "submit",
           },
-          {
-            id: dbUser.id,
-            username: dbUser.username,
-            display_name: dbUser.display_name,
-            role: dbUser.role,
-            roles: dbUser.roles || [],
-            permissions: dbUser.permissions || [],
-            department: dbUser.department,
-          },
+          actor,
         );
+        let createdFileIds = [];
         if (files.length) {
-          await complaints.createAttachments(id, files, dbUser.id, "file");
+          createdFileIds = await complaints.createAttachments(
+            id,
+            files,
+            dbUser.id,
+            "file",
+          );
         }
         if (signatures.length) {
           await complaints.createAttachments(id, signatures, dbUser.id, "signature");
@@ -311,6 +610,45 @@ export function registerComplaintRoutes(app, { pool, wrap, requireAuth }) {
         let nextPlan = req.body?.plan_form
           ? normalizePlanForm(req.body.plan_form)
           : previousPlan;
+
+        let pdfImageSlots = nextPlan.pdfImageSlots || {};
+        if (req.body?.pdf_image_slots) {
+          try {
+            const parsed =
+              typeof req.body.pdf_image_slots === "string"
+                ? JSON.parse(req.body.pdf_image_slots)
+                : req.body.pdf_image_slots;
+            if (parsed && typeof parsed === "object") {
+              pdfImageSlots = { ...pdfImageSlots, ...parsed };
+            }
+          } catch {
+            const error = new Error("ตำแหน่งรูปใน PDF ไม่ถูกต้อง");
+            error.status = 400;
+            throw error;
+          }
+        }
+
+        let newFileSlots = [];
+        if (req.body?.new_file_slots) {
+          try {
+            newFileSlots =
+              typeof req.body.new_file_slots === "string"
+                ? JSON.parse(req.body.new_file_slots)
+                : req.body.new_file_slots;
+            if (!Array.isArray(newFileSlots)) newFileSlots = [];
+          } catch {
+            newFileSlots = [];
+          }
+        }
+        createdFileIds.forEach((attachmentId, index) => {
+          const slot = String(newFileSlots[index] || "picture").trim() || "picture";
+          pdfImageSlots[String(attachmentId)] = slot;
+        });
+
+        nextPlan = {
+          ...nextPlan,
+          pdfImageSlots,
+        };
         // ถ้ารูปแบบที่ส่งมาไม่มี pdfImageSlots ให้คงค่าเดิมไว้
         if (
           req.body?.plan_form &&
@@ -360,8 +698,9 @@ export function registerComplaintRoutes(app, { pool, wrap, requireAuth }) {
           await complaints.updatePlanFormJson(id, nextPlan);
         }
 
+        const updatedRecord = await complaints.findById(id);
         res.json({
-          data: await withAttachments(await complaints.findById(id)),
+          data: await withAttachments(updatedRecord),
           changed:
             result.changed ||
             files.length > 0 ||
@@ -370,6 +709,18 @@ export function registerComplaintRoutes(app, { pool, wrap, requireAuth }) {
             planChanged,
           action: result.action,
         });
+
+        if (
+          notifier &&
+          updatedRecord?.workflow_status &&
+          updatedRecord.workflow_status !== prevStatus
+        ) {
+          notifyTelegram(
+            notifier.onStatusChange(updatedRecord, updatedRecord.workflow_status, actor),
+            "complaint_status_change",
+            { complaintId: updatedRecord.id, status: updatedRecord.workflow_status },
+          );
+        }
       } catch (error) {
         await Promise.all(
           uploaded.map((file) => unlink(file.path).catch(() => {})),
@@ -392,12 +743,7 @@ export function registerComplaintRoutes(app, { pool, wrap, requireAuth }) {
           error.status = 400;
           throw error;
         }
-        const dbUser = await users.findById(req.user.sub);
-        if (!dbUser) {
-          const error = new Error("ไม่พบบัญชีผู้ใช้");
-          error.status = 401;
-          throw error;
-        }
+        const dbUser = await resolveActor(req);
 
         let pdfImageSlots = {};
         if (req.body?.pdf_image_slots) {
@@ -521,6 +867,11 @@ export function registerComplaintRoutes(app, { pool, wrap, requireAuth }) {
     "/api/complaints/form-options",
     requireAuth,
     wrap(async (_req, res) => {
+      const now = Date.now();
+      if (formOptionsCache && now - formOptionsCachedAt < FORM_OPTIONS_TTL_MS) {
+        res.json(formOptionsCache);
+        return;
+      }
       const [departments] = await pool.query(
         `SELECT id, name FROM departments WHERE is_active = 1 ORDER BY name`,
       );
@@ -533,7 +884,39 @@ export function registerComplaintRoutes(app, { pool, wrap, requireAuth }) {
       const [flutes] = await pool.query(
         `SELECT id, name FROM flutes WHERE is_active = 1 ORDER BY name`,
       );
-      res.json({ departments, problems, machines, flutes });
+      formOptionsCache = {
+        departments,
+        problems,
+        machines,
+        flutes,
+        plan_signers: listPlanSigners(),
+      };
+      formOptionsCachedAt = now;
+      res.json(formOptionsCache);
+    }),
+  );
+
+  app.get(
+    "/api/plan-signers",
+    requireAuth,
+    wrap(async (_req, res) => {
+      res.json({ data: listPlanSigners() });
+    }),
+  );
+
+  app.get(
+    "/api/plan-signers/:id/signature",
+    requireAuth,
+    wrap(async (req, res) => {
+      const file = getPlanSignerSignaturePath(req.params.id);
+      if (!file) {
+        const error = new Error("ไม่พบลายเซ็น");
+        error.status = 404;
+        throw error;
+      }
+      res.setHeader("Content-Type", file.mimeType);
+      res.setHeader("Cache-Control", "private, max-age=3600");
+      res.sendFile(file.filePath);
     }),
   );
 
@@ -595,13 +978,9 @@ export function registerComplaintRoutes(app, { pool, wrap, requireAuth }) {
         error.status = 400;
         throw error;
       }
-      const dbUser = await users.findById(req.user.sub);
-      if (!dbUser) {
-        const error = new Error("ไม่พบบัญชีผู้ใช้");
-        error.status = 401;
-        throw error;
-      }
-      const result = await service.updateCurrentStep(id, req.body || {}, {
+      const dbUser = await resolveActor(req);
+      const prevStatus = (await complaints.findById(id))?.workflow_status;
+      const actor = {
         id: dbUser.id,
         username: dbUser.username,
         display_name: dbUser.display_name,
@@ -609,12 +988,22 @@ export function registerComplaintRoutes(app, { pool, wrap, requireAuth }) {
         roles: dbUser.roles || [],
         permissions: dbUser.permissions || [],
         department: dbUser.department,
-      });
+      };
+      const result = await service.updateCurrentStep(id, req.body || {}, actor);
       res.json({
         data: await withAttachments(result.record),
         changed: result.changed,
         action: result.action,
       });
+
+      // Notify on any workflow transition (submit / accept / confirm), not only action=submit.
+      if (notifier && result.record?.workflow_status && result.record.workflow_status !== prevStatus) {
+        notifyTelegram(
+          notifier.onStatusChange(result.record, result.record.workflow_status, actor),
+          "complaint_status_change",
+          { complaintId: result.record.id, status: result.record.workflow_status },
+        );
+      }
     }),
   );
 }

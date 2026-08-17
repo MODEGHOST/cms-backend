@@ -26,6 +26,22 @@ cms-backend/
     └── validators/
 ```
 
+## Runtime
+
+Server บริษัทใช้ **Node.js 16.20.x** (`engines`: `>=16.20.0`) — ชุดเดียวกับ IPMS (`prdproject`).
+
+IIS ใช้โครงเดียวกับ IPMS:
+
+| | Path |
+|---|---|
+| Frontend | `/lfb_cms/frontend` |
+| Backend | `/lfb_cms/backend` (`web.config` + `BASE_PATH=/lfb_cms/backend`) |
+
+บน server ใส่ค่าใน `.env.production` ตาม `.env.production.example` (`TRUST_PROXY=1`, `SEED_DEMO_DATA=0`)
+
+อัปโหลด: ทั้งโฟลเดอร์นี้ไป `lfb_cms/backend` — **อย่าลาก `node_modules` / `.env`**  
+บนเครื่อง server (Node 16) รัน `npm install` แล้ว Convert เป็น Application ใน IIS
+
 ## เริ่มต้น (XAMPP MySQL)
 
 ```bash

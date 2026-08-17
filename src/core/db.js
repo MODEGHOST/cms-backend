@@ -10,6 +10,11 @@ export function createPool() {
     database: config.db.database,
     waitForConnections: true,
     connectionLimit: config.db.connectionLimit,
+    // Cap waiting requests so the process does not grow an unbounded queue under load.
+    // Default is high enough that normal CMS traffic should never hit it.
+    queueLimit: config.db.queueLimit,
+    enableKeepAlive: true,
+    keepAliveInitialDelay: 10_000,
     dateStrings: true,
     charset: "utf8mb4",
   });

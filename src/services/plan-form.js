@@ -92,7 +92,11 @@ export function normalizePlanForm(raw) {
   for (const role of PLAN_APPROVAL_ROLES) {
     const incoming = approvals[role.key] || {};
     const signatureId = Number(incoming.signatureId || incoming.signature_id || 0);
+    const signerId = Number(incoming.signerId || incoming.signer_id || 0);
     base.approvals[role.key] = {
+      signerId: Number.isInteger(signerId) && signerId > 0 ? signerId : null,
+      name: String(incoming.name || "").trim(),
+      position: String(incoming.position || "").trim(),
       signatureId: Number.isInteger(signatureId) && signatureId > 0 ? signatureId : null,
     };
   }

@@ -85,9 +85,14 @@ async function main() {
     }
 
     const [rows] = await pool.query(
-      `SELECT p.id, p.username, p.display_name, m.role, p.department, p.is_active
+      `SELECT p.id, p.username, p.display_name,
+              GROUP_CONCAT(r.name ORDER BY r.name) AS roles,
+              p.department, p.is_active
        FROM users p
        LEFT JOIN cms_memberships m ON m.user_id = p.id
+       LEFT JOIN cms_membership_roles mr ON mr.user_id = p.id
+       LEFT JOIN cms_roles r ON r.id = mr.role_id
+       GROUP BY p.id, p.username, p.display_name, p.department, p.is_active
        ORDER BY p.id ASC`,
     );
 

@@ -17,20 +17,24 @@ export function hasRole(user, roleName) {
   return user.role === roleName;
 }
 
+export function isBuiltInAdmin(user) {
+  return hasRole(user, "developer") || hasRole(user, "admin");
+}
+
 export function isCmsAdmin(user) {
-  return (
-    hasRole(user, "developer") ||
-    hasRole(user, "admin") ||
-    hasPermission(user, "complaints.manage_all")
-  );
+  return isBuiltInAdmin(user) || hasPermission(user, "complaints.manage_all");
 }
 
 export function canManageSystem(user) {
-  return (
-    isCmsAdmin(user) ||
-    hasPermission(user, "system.manage") ||
-    hasPermission(user, "members.manage")
-  );
+  return isBuiltInAdmin(user);
+}
+
+export function canAccessMasters(user) {
+  return isBuiltInAdmin(user) || hasPermission(user, "masters.read");
+}
+
+export function canManageMasters(user) {
+  return isBuiltInAdmin(user);
 }
 
 export function canCsWork(user) {
@@ -47,10 +51,6 @@ export function canDepartmentWork(user) {
 
 export function canUpdateRejects(user) {
   return isCmsAdmin(user) || hasPermission(user, "rejects.update");
-}
-
-export function canManageMasters(user) {
-  return isCmsAdmin(user) || hasPermission(user, "masters.manage");
 }
 
 export function requirePermission(...permissions) {

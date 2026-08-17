@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS Center_user_lfb (
   password_hash VARCHAR(255) NOT NULL,
   email VARCHAR(190) NOT NULL,
   telegram_id VARCHAR(64) NULL,
+  telegram_chat_id VARCHAR(64) NULL,
   department VARCHAR(120) NULL,
   status ENUM('active', 'suspended', 'pending') NOT NULL DEFAULT 'active',
   token_version INT UNSIGNED NOT NULL DEFAULT 0,
@@ -23,5 +24,6 @@ CREATE TABLE IF NOT EXISTS Center_user_lfb (
   PRIMARY KEY (id),
   UNIQUE KEY uq_center_user_username (username),
   UNIQUE KEY uq_center_user_email (email),
-  UNIQUE KEY uq_center_user_telegram (telegram_id)
+  UNIQUE KEY uq_center_user_telegram (telegram_id),
+  UNIQUE KEY uq_center_user_telegram_chat (telegram_chat_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

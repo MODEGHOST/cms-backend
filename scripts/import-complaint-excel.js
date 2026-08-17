@@ -13,6 +13,7 @@ import { resolve } from "node:path";
 import XLSX from "xlsx";
 import { createPool } from "../src/core/db.js";
 import { logger } from "../src/core/logger.js";
+import { canonicalizeDepartmentName, isCanonicalDepartment } from "../src/utils/department-map.js";
 
 const DEFAULT_EXCEL = "c:/Users/sa.data02/Downloads/ทะเบียนข้อร้องเรียน.xlsx";
 const DEFAULT_SHEET = "2026";
@@ -155,8 +156,38 @@ function parseDocumentScope(value) {
 }
 
 async function upsertMaster(conn, table, name) {
-  const clean = cleanText(name);
+  const clean =
+    table === "departments" ? canonicalizeDepartmentName(name) : cleanText(name);
   if (!clean) return null;
+  if (table === "departments") {
+    const [[existing]] = await conn.query(
+      `SELECT id FROM departments
+       WHERE LOWER(name) = LOWER(?)
+       ORDER BY is_active DESC, id ASC
+       LIMIT 1`,
+      [clean],
+    );
+    if (existing?.id) {
+      await conn.query(`UPDATE departments SET is_active = 1, name = ? WHERE id = ?`, [
+        clean,
+        existing.id,
+      ]);
+      return existing.id;
+    }
+    // ห้ามสร้างแผนกนอก Master จาก Excel เก่า
+    if (!isCanonicalDepartment(clean)) {
+      logger.warn(`Skip unknown department from Excel: ${JSON.stringify(name)} → ${JSON.stringify(clean)}`);
+      return null;
+    }
+    await conn.query(`INSERT INTO departments (name, is_active) VALUES (?, 1)`, [
+      clean,
+    ]);
+    const [[row]] = await conn.query(
+      `SELECT id FROM departments WHERE LOWER(name) = LOWER(?) LIMIT 1`,
+      [clean],
+    );
+    return row?.id ?? null;
+  }
   await conn.query(
     `INSERT INTO ${table} (name, is_active) VALUES (?, 1)
      ON DUPLICATE KEY UPDATE is_active = VALUES(is_active)`,
@@ -274,23 +305,123 @@ function findSheetName(wb, wanted) {
   return wb.SheetNames.find((name) => String(name).trim().toLowerCase() === target) || null;
 }
 
+function resolveSheetNames(wb, sheetWanted) {
+  const wanted = String(sheetWanted || "").trim().toLowerCase();
+  if (!wanted || wanted === "all" || wanted === "*") {
+    return wb.SheetNames.filter((name) => /^\s*\d{4}\s*$/.test(String(name)));
+  }
+  const one = findSheetName(wb, sheetWanted);
+  return one ? [one] : [];
+}
+
+async function importSheet(conn, sheet, sheetName) {
+  const textMatrix = XLSX.utils.sheet_to_json(sheet, {
+    header: 1,
+    defval: null,
+    raw: false,
+  });
+  const rawMatrix = XLSX.utils.sheet_to_json(sheet, {
+    header: 1,
+    defval: null,
+    raw: true,
+  });
+
+  let imported = 0;
+  let skipped = 0;
+
+  // Row 0 = title, row 1 = headers, data starts at row 2
+  for (let i = 2; i < textMatrix.length; i += 1) {
+    const textRow = textMatrix[i];
+    const rawRow = rawMatrix[i] || textRow;
+    if (!Array.isArray(textRow) || !textRow.some((v) => cleanText(v))) {
+      skipped += 1;
+      continue;
+    }
+
+    const row = mapRow(rawRow, textRow);
+    if (!row.problemTh && !row.companyName && !row.received_date) {
+      skipped += 1;
+      continue;
+    }
+
+    const companyId = await upsertCompany(conn, row.companyName, row.aliasName);
+    const aliasId = await upsertAlias(conn, companyId, row.aliasName);
+    const fluteId = await upsertMaster(conn, "flutes", row.fluteName);
+    const machineId = await upsertMaster(conn, "machines", row.machineName);
+    const problemId = await upsertProblem(conn, row.problemTh, row.problemEn);
+    const reportedById = await upsertMaster(conn, "departments", row.reportedByName);
+    const responsibleId = await upsertMaster(conn, "departments", row.responsibleName);
+
+    if (row.shift && ["A", "B", "C"].includes(row.shift)) {
+      await upsertMaster(conn, "shifts", row.shift);
+    }
+
+    await conn.query(
+      `INSERT INTO complaint_records (
+        excel_seq,
+        company_id, customer_alias_id, flute_id, machine_id, problem_id,
+        reported_by_department_id, responsible_department_id,
+        pdr_no, order_no, product_name,
+        paper_m5, paper_m4, paper_m3, paper_m2, paper_m1,
+        plan_no, shift,
+        delivery_date, production_date, received_date, completed_date,
+        demand_qty, ng_qty, grade, sale_cs_staff,
+        document_accepted, document_scope, document_no,
+        doc_forward_date, doc_receiver, doc_reply_date, doc_cs_sale_date, lead_time_days,
+        cause, correction, prevention, remark,
+        workflow_status, confirmed_at
+      ) VALUES (
+        ?,
+        ?,?,?,?,?,
+        ?,?,
+        ?,?,?,
+        ?,?,?,?,?,
+        ?,?,
+        ?,?,?,?,
+        ?,?,?,?,
+        ?,?,?,
+        ?,?,?,?,?,
+        ?,?,?,?,
+        'completed', ?
+      )`,
+      [
+        row.excel_seq,
+        companyId, aliasId, fluteId, machineId, problemId,
+        reportedById, responsibleId,
+        row.pdr_no, row.order_no, row.product_name,
+        row.paper_m5, row.paper_m4, row.paper_m3, row.paper_m2, row.paper_m1,
+        row.plan_no, row.shift,
+        row.delivery_date, row.production_date, row.received_date,
+        row.completed_date || row.received_date || row.doc_reply_date || null,
+        row.demand_qty, row.ng_qty, row.grade, row.sale_cs_staff,
+        row.document_accepted, row.document_scope, row.document_no,
+        row.doc_forward_date, row.doc_receiver, row.doc_reply_date, row.doc_cs_sale_date, row.lead_time_days,
+        row.cause, row.correction, row.prevention, row.remark,
+        // Excel เก่า = เคสที่ปิดแล้วในทะเบียน
+        row.completed_date || row.received_date || row.doc_reply_date || null,
+      ],
+    );
+    imported += 1;
+  }
+
+  logger.info(
+    `Complaint sheet ${JSON.stringify(sheetName)}: imported=${imported} skipped=${skipped}`,
+  );
+  return { imported, skipped };
+}
+
 async function main() {
   const excelPath = resolve(process.argv[2] || DEFAULT_EXCEL);
-  const sheetWanted = process.argv[3] || DEFAULT_SHEET;
+  const sheetWanted = process.argv[3] || "all";
 
   const buffer = await readFile(excelPath);
   const wb = XLSX.read(buffer, { type: "buffer", cellDates: true });
-  const sheetName = findSheetName(wb, sheetWanted);
-  if (!sheetName) {
+  const sheetNames = resolveSheetNames(wb, sheetWanted);
+  if (!sheetNames.length) {
     throw new Error(
       `ไม่พบ sheet "${sheetWanted}" ในไฟล์ (มี: ${wb.SheetNames.map((s) => JSON.stringify(s)).join(", ")})`,
     );
   }
-
-  const sheet = wb.Sheets[sheetName];
-  // header:1 — skip title + header rows; use column indexes (Excel headers have newlines)
-  const textMatrix = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null, raw: false });
-  const rawMatrix = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null, raw: true });
 
   const pool = createPool();
   const conn = await pool.getConnection();
@@ -299,81 +430,18 @@ async function main() {
 
   try {
     await conn.beginTransaction();
+    await conn.query("DELETE FROM complaint_attachments");
     await conn.query("DELETE FROM complaint_records");
 
-    // Row 0 = title, row 1 = headers, data starts at row 2
-    for (let i = 2; i < textMatrix.length; i += 1) {
-      const textRow = textMatrix[i];
-      const rawRow = rawMatrix[i] || textRow;
-      if (!Array.isArray(textRow) || !textRow.some((v) => cleanText(v))) {
-        skipped += 1;
-        continue;
-      }
-
-      const row = mapRow(rawRow, textRow);
-      if (!row.problemTh && !row.companyName && !row.received_date) {
-        skipped += 1;
-        continue;
-      }
-
-      const companyId = await upsertCompany(conn, row.companyName, row.aliasName);
-      const aliasId = await upsertAlias(conn, companyId, row.aliasName);
-      const fluteId = await upsertMaster(conn, "flutes", row.fluteName);
-      const machineId = await upsertMaster(conn, "machines", row.machineName);
-      const problemId = await upsertProblem(conn, row.problemTh, row.problemEn);
-      const reportedById = await upsertMaster(conn, "departments", row.reportedByName);
-      const responsibleId = await upsertMaster(conn, "departments", row.responsibleName);
-
-      if (row.shift && ["A", "B", "C"].includes(row.shift)) {
-        await upsertMaster(conn, "shifts", row.shift);
-      }
-
-      await conn.query(
-        `INSERT INTO complaint_records (
-          excel_seq,
-          company_id, customer_alias_id, flute_id, machine_id, problem_id,
-          reported_by_department_id, responsible_department_id,
-          pdr_no, order_no, product_name,
-          paper_m5, paper_m4, paper_m3, paper_m2, paper_m1,
-          plan_no, shift,
-          delivery_date, production_date, received_date, completed_date,
-          demand_qty, ng_qty, grade, sale_cs_staff,
-          document_accepted, document_scope, document_no,
-          doc_forward_date, doc_receiver, doc_reply_date, doc_cs_sale_date, lead_time_days,
-          cause, correction, prevention, remark
-        ) VALUES (
-          ?,
-          ?,?,?,?,?,
-          ?,?,
-          ?,?,?,
-          ?,?,?,?,?,
-          ?,?,
-          ?,?,?,?,
-          ?,?,?,?,
-          ?,?,?,
-          ?,?,?,?,?,
-          ?,?,?,?
-        )`,
-        [
-          row.excel_seq,
-          companyId, aliasId, fluteId, machineId, problemId,
-          reportedById, responsibleId,
-          row.pdr_no, row.order_no, row.product_name,
-          row.paper_m5, row.paper_m4, row.paper_m3, row.paper_m2, row.paper_m1,
-          row.plan_no, row.shift,
-          row.delivery_date, row.production_date, row.received_date, row.completed_date,
-          row.demand_qty, row.ng_qty, row.grade, row.sale_cs_staff,
-          row.document_accepted, row.document_scope, row.document_no,
-          row.doc_forward_date, row.doc_receiver, row.doc_reply_date, row.doc_cs_sale_date, row.lead_time_days,
-          row.cause, row.correction, row.prevention, row.remark,
-        ],
-      );
-      imported += 1;
+    for (const sheetName of sheetNames) {
+      const result = await importSheet(conn, wb.Sheets[sheetName], sheetName);
+      imported += result.imported;
+      skipped += result.skipped;
     }
 
     await conn.commit();
     logger.info(
-      `Complaint import done: sheet=${JSON.stringify(sheetName)} imported=${imported} skipped=${skipped} file=${excelPath}`,
+      `Complaint import done: sheets=${JSON.stringify(sheetNames)} imported=${imported} skipped=${skipped} file=${excelPath}`,
     );
   } catch (err) {
     await conn.rollback();

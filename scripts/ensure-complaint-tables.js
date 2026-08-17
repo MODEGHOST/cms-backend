@@ -98,10 +98,13 @@ async function main() {
 
         demand_qty DECIMAL(14, 2) NULL,
         ng_qty DECIMAL(14, 2) NULL,
+        cs_remark TEXT NULL,
         grade VARCHAR(10) NULL,
         sale_cs_staff VARCHAR(120) NULL,
 
         document_accepted ENUM('P', 'O') NULL,
+        document_accepted_at DATETIME NULL,
+        document_deadline_warned_on DATE NULL,
         document_scope ENUM('ภายใน', 'ภายนอก') NULL,
         document_no VARCHAR(80) NULL,
         doc_forward_date DATE NULL,
@@ -143,6 +146,8 @@ async function main() {
         KEY idx_complaint_pdr (pdr_no),
         KEY idx_complaint_document_no (document_no),
         KEY idx_complaint_grade (grade),
+        KEY idx_complaint_workflow (workflow_status),
+        KEY idx_complaint_received_workflow (received_date, workflow_status),
 
         CONSTRAINT fk_complaint_company
           FOREIGN KEY (company_id) REFERENCES companies (id)
@@ -307,6 +312,27 @@ async function main() {
       "complaint_records",
       "plan_form_json",
       `JSON NULL AFTER remark`,
+    );
+
+    await ensureColumn(
+      conn,
+      "complaint_records",
+      "cs_remark",
+      `TEXT NULL AFTER ng_qty`,
+    );
+
+    await ensureColumn(
+      conn,
+      "complaint_records",
+      "document_accepted_at",
+      `DATETIME NULL AFTER document_accepted`,
+    );
+
+    await ensureColumn(
+      conn,
+      "complaint_records",
+      "document_deadline_warned_on",
+      `DATE NULL AFTER document_accepted_at`,
     );
 
     const [[flutes]] = await conn.query("SELECT COUNT(*) AS c FROM flutes");

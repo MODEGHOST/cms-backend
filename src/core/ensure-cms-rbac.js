@@ -1,3 +1,16 @@
+/**
+ * Ensure RBAC tables + seed catalogs exist.
+ * Role = access level (developer / admin / staff / viewer).
+ * Workflow permissions for staff come from department at hydrate time.
+ * Migrates legacy workflow roles (cs / qa / qc / department) → staff + department.
+ */
+import { canonicalizeDepartmentName } from "../utils/department-map.js";
+import {
+  LEGACY_WORKFLOW_ROLES,
+  STAFF_BASE_PERMISSIONS,
+  pickDefaultDepartmentFromLegacyRoles,
+} from "../utils/department-permissions.js";
+
 const ROLES = [
   {
     name: "developer",
@@ -5,13 +18,10 @@ const ROLES = [
     description: "ทีมพัฒนาระบบ — จัดการทุกอย่างใน CMS",
   },
   { name: "admin", label: "ผู้ดูแลระบบ", description: "สิทธิ์เต็มใน CMS" },
-  { name: "cs", label: "CS", description: "งาน Complaint ขั้น CS" },
-  { name: "qa", label: "QA", description: "งาน Complaint ขั้น QA" },
-  { name: "qc", label: "QC", description: "แก้ Reject + ขั้น QA ของ Complaint" },
   {
-    name: "department",
-    label: "หน่วยงาน",
-    description: "รับเรื่อง/กรอกตามหน่วยงานที่รับผิดชอบ",
+    name: "staff",
+    label: "พนักงาน",
+    description: "พนักงานทั่วไป — สิทธิ์งานขึ้นกับแผนกที่สังกัด",
   },
   { name: "viewer", label: "ผู้ดูอย่างเดียว", description: "อ่านข้อมูลได้อย่างเดียว" },
 ];
@@ -43,46 +53,8 @@ const ALL_CODES = PERMISSIONS.map((p) => p.code);
 const ROLE_PERMISSIONS = {
   developer: ALL_CODES,
   admin: ALL_CODES,
-  cs: [
-    "rejects.read",
-    "complaints.read",
-    "complaints.cs",
-    "masters.read",
-    "dashboard.read",
-    "activity.read",
-  ],
-  qa: [
-    "rejects.read",
-    "complaints.read",
-    "complaints.qa",
-    "masters.read",
-    "dashboard.read",
-    "activity.read",
-  ],
-  qc: [
-    "rejects.read",
-    "rejects.update",
-    "complaints.read",
-    "complaints.qa",
-    "masters.read",
-    "dashboard.read",
-    "activity.read",
-  ],
-  department: [
-    "rejects.read",
-    "complaints.read",
-    "complaints.department",
-    "masters.read",
-    "dashboard.read",
-    "activity.read",
-  ],
-  viewer: [
-    "rejects.read",
-    "complaints.read",
-    "masters.read",
-    "dashboard.read",
-    "activity.read",
-  ],
+  staff: [...STAFF_BASE_PERMISSIONS],
+  viewer: [...STAFF_BASE_PERMISSIONS],
 };
 
 async function tableExists(conn, table) {
@@ -107,6 +79,106 @@ async function columnExists(conn, table, column) {
     [table, column],
   );
   return rows.length > 0;
+}
+
+/**
+ * Move members off legacy workflow roles onto staff + department defaults.
+ * Idempotent — safe on every boot.
+ */
+async function migrateLegacyWorkflowRoles(conn, roleIdByName) {
+  if (!roleIdByName.staff) {
+    return { migrated_users: 0, removed_legacy_roles: 0 };
+  }
+
+  const [legacyRoleRows] = await conn.query(
+    `SELECT id, name FROM cms_roles WHERE name IN (?)`,
+    [LEGACY_WORKFLOW_ROLES],
+  );
+  if (!legacyRoleRows.length) {
+    return { migrated_users: 0, removed_legacy_roles: 0 };
+  }
+  const legacyIds = legacyRoleRows.map((r) => r.id);
+
+  const [affected] = await conn.query(
+    `SELECT DISTINCT user_id
+     FROM cms_membership_roles
+     WHERE role_id IN (${legacyIds.map(() => "?").join(",")})`,
+    legacyIds,
+  );
+
+  let migratedUsers = 0;
+  for (const { user_id: userId } of affected) {
+    const [roleRows] = await conn.query(
+      `SELECT r.name
+       FROM cms_membership_roles mr
+       JOIN cms_roles r ON r.id = mr.role_id
+       WHERE mr.user_id = ?`,
+      [userId],
+    );
+    const roleNames = roleRows.map((r) => r.name);
+    const legacyHeld = roleNames.filter((n) =>
+      LEGACY_WORKFLOW_ROLES.includes(n),
+    );
+    if (!legacyHeld.length) continue;
+
+    const [[profile]] = await conn.query(
+      `SELECT id, department FROM users WHERE id = ? LIMIT 1`,
+      [userId],
+    );
+    const existingDept = canonicalizeDepartmentName(profile?.department);
+    const department =
+      existingDept || pickDefaultDepartmentFromLegacyRoles(legacyHeld);
+
+    if (profile && department && !existingDept) {
+      await conn.query(`UPDATE users SET department = ? WHERE id = ?`, [
+        department,
+        userId,
+      ]);
+    }
+
+    const keepRoles = roleNames.filter(
+      (n) => !LEGACY_WORKFLOW_ROLES.includes(n),
+    );
+    const hasElevated = keepRoles.some(
+      (n) => n === "developer" || n === "admin",
+    );
+
+    let nextRoles = [...keepRoles];
+    if (!hasElevated) {
+      nextRoles = nextRoles.filter((n) => n !== "viewer");
+      if (!nextRoles.includes("staff")) nextRoles.push("staff");
+    }
+
+    await conn.query(`DELETE FROM cms_membership_roles WHERE user_id = ?`, [
+      userId,
+    ]);
+    for (const name of [...new Set(nextRoles)]) {
+      const roleId = roleIdByName[name];
+      if (!roleId) continue;
+      await conn.query(
+        `INSERT IGNORE INTO cms_membership_roles (user_id, role_id) VALUES (?, ?)`,
+        [userId, roleId],
+      );
+    }
+    migratedUsers += 1;
+  }
+
+  let removed = 0;
+  for (const legacy of legacyRoleRows) {
+    const [[{ used }]] = await conn.query(
+      `SELECT COUNT(*) AS used FROM cms_membership_roles WHERE role_id = ?`,
+      [legacy.id],
+    );
+    if (Number(used) === 0) {
+      await conn.query(`DELETE FROM cms_role_permissions WHERE role_id = ?`, [
+        legacy.id,
+      ]);
+      await conn.query(`DELETE FROM cms_roles WHERE id = ?`, [legacy.id]);
+      removed += 1;
+    }
+  }
+
+  return { migrated_users: migratedUsers, removed_legacy_roles: removed };
 }
 
 /**
@@ -217,28 +289,49 @@ export async function ensureCmsRbac(conn) {
     );
   }
 
-  const [roleRows] = await conn.query(`SELECT id, name FROM cms_roles`);
+  let [roleRows] = await conn.query(`SELECT id, name FROM cms_roles`);
   const [permRows] = await conn.query(`SELECT id, code FROM cms_permissions`);
-  const roleIdByName = Object.fromEntries(roleRows.map((r) => [r.name, r.id]));
+  let roleIdByName = Object.fromEntries(roleRows.map((r) => [r.name, r.id]));
   const permIdByCode = Object.fromEntries(permRows.map((p) => [p.code, p.id]));
 
   for (const [roleName, codes] of Object.entries(ROLE_PERMISSIONS)) {
     const roleId = roleIdByName[roleName];
-    for (const code of codes) {
-      const permissionId = permIdByCode[code];
-      if (!roleId || !permissionId) continue;
+    if (!roleId) continue;
+    const keepIds = codes
+      .map((code) => permIdByCode[code])
+      .filter(Boolean);
+    for (const permissionId of keepIds) {
       await conn.query(
         `INSERT IGNORE INTO cms_role_permissions (role_id, permission_id)
          VALUES (?, ?)`,
         [roleId, permissionId],
       );
     }
+    if (keepIds.length) {
+      await conn.query(
+        `DELETE FROM cms_role_permissions
+         WHERE role_id = ?
+           AND permission_id NOT IN (${keepIds.map(() => "?").join(",")})`,
+        [roleId, ...keepIds],
+      );
+    } else {
+      await conn.query(
+        `DELETE FROM cms_role_permissions WHERE role_id = ?`,
+        [roleId],
+      );
+    }
   }
+
+  const migration = await migrateLegacyWorkflowRoles(conn, roleIdByName);
+
+  [roleRows] = await conn.query(`SELECT id, name FROM cms_roles`);
+  roleIdByName = Object.fromEntries(roleRows.map((r) => [r.name, r.id]));
 
   return {
     roles: roleRows.length,
     permissions: permRows.length,
     had_legacy_role_column: hadLegacyRole,
+    ...migration,
   };
 }
 

@@ -1,5 +1,5 @@
 import { createMasterService } from "../services/masters.js";
-import { canManageMasters, hasPermission } from "../core/authz.js";
+import { canAccessMasters, canManageMasters } from "../core/authz.js";
 
 /**
  * Master APIs — filtering / search / pagination happen on backend.
@@ -21,7 +21,7 @@ export function registerMasterRoutes(app, { pool, wrap, requireAuth }) {
       `/api/masters/${key}`,
       requireAuth,
       wrap(async (req, res) => {
-        if (!hasPermission(req.user, "masters.read") && !canManageMasters(req.user)) {
+        if (!canAccessMasters(req.user)) {
           return res.status(403).json({ message: "ไม่มีสิทธิ์ดู Master" });
         }
         const result = await masters.list(key, req.query);

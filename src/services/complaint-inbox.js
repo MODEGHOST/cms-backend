@@ -4,6 +4,7 @@ import {
   canQaWork,
   isCmsAdmin,
 } from "../core/authz.js";
+import { canonicalizeDepartmentName } from "../utils/department-map.js";
 
 export const COMPLAINT_WORKFLOW_LABELS = {
   cs_draft: "รอ CS",
@@ -38,7 +39,8 @@ export function buildComplaintInboxFilter(user) {
     parts.push(`cr.workflow_status IN ('pending_qa', 'qa_review', 'qa_confirm')`);
   }
   if (canDepartmentWork(user)) {
-    const department = String(user?.department || "").trim();
+    // canonicalize ให้ตรงกับ isResponsibleDepartmentUser (เช่น CRM → MKT)
+    const department = canonicalizeDepartmentName(user?.department);
     if (department) {
       parts.push(
         `(cr.workflow_status IN ('pending_department', 'department_action')

@@ -5,6 +5,13 @@ import {
 } from "../core/ensure-cms-rbac.js";
 import { httpError } from "../core/http-error.js";
 import { centerUserTableSql, createUserRepository } from "../repositories/users.js";
+import { canonicalizeDepartmentName } from "../utils/department-map.js";
+import {
+  STAFF_BASE_PERMISSIONS,
+  WORKFLOW_PERMISSION_LABELS,
+  listDepartmentWorkMatrix,
+} from "../utils/department-permissions.js";
+import { paginatedJson, parsePagination } from "../validators/common.js";
 
 function requireSystemManage(req) {
   if (!canManageSystem(req.user)) {
@@ -19,6 +26,18 @@ function slugifyRoleLabel(label) {
     .replace(/[^a-z0-9]+/g, "_")
     .replace(/^_+|_+$/g, "")
     .slice(0, 30) || "role";
+}
+
+function normalizeMemberDepartment(value) {
+  if (value === undefined) return undefined;
+  return canonicalizeDepartmentName(value);
+}
+
+function requireStaffDepartment(roleNames, department) {
+  if (!(roleNames || []).includes("staff")) return;
+  if (!department) {
+    throw httpError(400, "Role พนักงานต้องระบุแผนก (สิทธิ์งานมาจากแผนก)");
+  }
 }
 
 export function registerSystemRoutes(app, { pool, wrap, requireAuth }) {
@@ -90,7 +109,7 @@ export function registerSystemRoutes(app, { pool, wrap, requireAuth }) {
          LEFT JOIN cms_permissions p ON p.id = rp.permission_id
          GROUP BY r.id, r.name, r.label, r.description, r.is_system
          ORDER BY r.is_system DESC,
-                  FIELD(r.name, 'developer','admin','qc','qa','cs','department','viewer'),
+                  FIELD(r.name, 'developer','admin','staff','viewer'),
                   r.id`,
       );
       res.json({
@@ -123,6 +142,20 @@ export function registerSystemRoutes(app, { pool, wrap, requireAuth }) {
           ...row,
           grantable_to_custom_role: !isCmsHierarchyPermission(row.code),
         })),
+      });
+    }),
+  );
+
+  app.get(
+    "/api/system/department-work-permissions",
+    requireAuth,
+    wrap(async (req, res) => {
+      requireSystemManage(req);
+      res.json({
+        data: listDepartmentWorkMatrix(),
+        staff_base: STAFF_BASE_PERMISSIONS,
+        workflow_labels: WORKFLOW_PERMISSION_LABELS,
+        note: "Role พนักงานได้สิทธิ์อ่านพื้นฐาน + สิทธิ์งานตามแผนกด้านล่างอัตโนมัติ",
       });
     }),
   );
@@ -285,6 +318,9 @@ export function registerSystemRoutes(app, { pool, wrap, requireAuth }) {
     wrap(async (req, res) => {
       requireSystemManage(req);
       const q = String(req.query.q || "").trim();
+      const department = String(req.query.department || "").trim();
+      const memberDeptExpr =
+        "COALESCE(NULLIF(TRIM(p.department), ''), NULLIF(TRIM(c.department), ''))";
       const params = [];
       let where = "1=1";
       if (q) {
@@ -292,41 +328,84 @@ export function registerSystemRoutes(app, { pool, wrap, requireAuth }) {
         const like = `%${q}%`;
         params.push(like, like, like);
       }
-      const [rows] = await pool.query(
-        `SELECT
-           c.id,
-           c.username,
-           c.email,
-           c.first_name,
-           c.last_name,
-           c.status AS center_status,
-           COALESCE(p.display_name, CONCAT(c.first_name, ' ', c.last_name)) AS display_name,
-           COALESCE(p.department, c.department) AS department,
-           m.is_active,
-           GROUP_CONCAT(r.name ORDER BY r.name) AS role_names,
-           GROUP_CONCAT(r.label ORDER BY r.name) AS role_labels
+      if (department === "__none__") {
+        where += ` AND ${memberDeptExpr} IS NULL`;
+      } else if (department) {
+        where += ` AND ${memberDeptExpr} = ?`;
+        params.push(department);
+      }
+      const { page, pageSize, offset } = parsePagination({
+        ...req.query,
+        pageSize: req.query.pageSize || 6,
+      });
+      const fromSql = `
          FROM cms_memberships m
          JOIN ${center} c ON c.id = m.user_id
          LEFT JOIN users p ON p.id = m.user_id
          LEFT JOIN cms_membership_roles mr ON mr.user_id = m.user_id
          LEFT JOIN cms_roles r ON r.id = mr.role_id
-         WHERE ${where}
-         GROUP BY c.id, c.username, c.email, c.first_name, c.last_name, c.status,
-                  p.display_name, p.department, c.department, m.is_active
-         ORDER BY c.username`,
-        params,
-      );
+         WHERE ${where}`;
+      const [[[countRow]], [rows], [deptFacetRows]] = await Promise.all([
+        pool.query(
+          `SELECT COUNT(*) AS total
+           FROM cms_memberships m
+           JOIN ${center} c ON c.id = m.user_id
+           LEFT JOIN users p ON p.id = m.user_id
+           WHERE ${where}`,
+          params,
+        ),
+        pool.query(
+          `SELECT
+             c.id,
+             c.username,
+             c.email,
+             c.first_name,
+             c.last_name,
+             c.status AS center_status,
+             COALESCE(p.display_name, CONCAT(c.first_name, ' ', c.last_name)) AS display_name,
+             ${memberDeptExpr} AS department,
+             m.is_active,
+             GROUP_CONCAT(r.name ORDER BY r.name) AS role_names,
+             GROUP_CONCAT(r.label ORDER BY r.name) AS role_labels
+           ${fromSql}
+           GROUP BY c.id, c.username, c.email, c.first_name, c.last_name, c.status,
+                    p.display_name, p.department, c.department, m.is_active
+           ORDER BY c.username
+           LIMIT ? OFFSET ?`,
+          [...params, pageSize, offset],
+        ),
+        // Facets ignore department filter so tabs stay complete while browsing.
+        pool.query(
+          `SELECT dept AS department, COUNT(*) AS member_count
+           FROM (
+             SELECT ${memberDeptExpr} AS dept
+             FROM cms_memberships m
+             JOIN ${center} c ON c.id = m.user_id
+             LEFT JOIN users p ON p.id = m.user_id
+           ) t
+           GROUP BY dept
+           ORDER BY CASE WHEN dept IS NULL THEN 1 ELSE 0 END, dept`,
+        ),
+      ]);
       res.json({
-        data: rows.map((row) => ({
-          id: Number(row.id),
-          username: row.username,
-          email: row.email,
-          display_name: row.display_name,
-          department: row.department,
-          is_active: Number(row.is_active) === 1,
-          center_status: row.center_status,
-          roles: row.role_names ? String(row.role_names).split(",") : [],
-          role_labels: row.role_labels ? String(row.role_labels).split(",") : [],
+        ...paginatedJson(
+          rows.map((row) => ({
+            id: Number(row.id),
+            username: row.username,
+            email: row.email,
+            display_name: row.display_name,
+            department: row.department,
+            is_active: Number(row.is_active) === 1,
+            center_status: row.center_status,
+            roles: row.role_names ? String(row.role_names).split(",") : [],
+            role_labels: row.role_labels ? String(row.role_labels).split(",") : [],
+          })),
+          Number(countRow?.total || 0),
+          { page, pageSize },
+        ),
+        departments: deptFacetRows.map((row) => ({
+          department: row.department || null,
+          count: Number(row.member_count || 0),
         })),
       });
     }),
@@ -385,7 +464,7 @@ export function registerSystemRoutes(app, { pool, wrap, requireAuth }) {
       const department =
         req.body?.department === undefined
           ? undefined
-          : String(req.body.department || "").trim() || null;
+          : normalizeMemberDepartment(req.body.department);
 
       if (!Number.isInteger(userId) || userId <= 0) {
         throw httpError(400, "user_id ไม่ถูกต้อง");
@@ -403,6 +482,12 @@ export function registerSystemRoutes(app, { pool, wrap, requireAuth }) {
         throw httpError(404, "ไม่พบบัญชีใน Center_user_lfb");
       }
 
+      const resolvedDepartment =
+        department !== undefined
+          ? department
+          : normalizeMemberDepartment(centerUser.department);
+      requireStaffDepartment(roleNames, resolvedDepartment);
+
       const displayName =
         `${centerUser.first_name || ""} ${centerUser.last_name || ""}`.trim() ||
         centerUser.username;
@@ -411,8 +496,7 @@ export function registerSystemRoutes(app, { pool, wrap, requireAuth }) {
         id: centerUser.id,
         username: centerUser.username,
         displayName,
-        department:
-          department !== undefined ? department : centerUser.department,
+        department: resolvedDepartment,
         isActive: true,
       });
       await users.setRoles(centerUser.id, roleNames);
@@ -462,6 +546,15 @@ export function registerSystemRoutes(app, { pool, wrap, requireAuth }) {
             "ไม่สามารถถอด role developer/admin ของตัวเองได้",
           );
         }
+        const [[profile]] = await pool.query(
+          `SELECT department FROM users WHERE id = ? LIMIT 1`,
+          [userId],
+        );
+        const nextDept =
+          req.body?.department !== undefined
+            ? normalizeMemberDepartment(req.body.department)
+            : normalizeMemberDepartment(profile?.department);
+        requireStaffDepartment(roleNames, nextDept);
         await users.setRoles(userId, roleNames);
       }
 
@@ -483,6 +576,25 @@ export function registerSystemRoutes(app, { pool, wrap, requireAuth }) {
           throw httpError(400, "ไม่สามารถปิดใช้งานบัญชีของตัวเองได้");
         }
 
+        const nextDepartment =
+          req.body?.department !== undefined
+            ? normalizeMemberDepartment(req.body.department)
+            : profile?.department || null;
+
+        if (req.body?.department !== undefined) {
+          const [roleRows] = await pool.query(
+            `SELECT r.name
+             FROM cms_membership_roles mr
+             JOIN cms_roles r ON r.id = mr.role_id
+             WHERE mr.user_id = ?`,
+            [userId],
+          );
+          requireStaffDepartment(
+            roleRows.map((r) => r.name),
+            nextDepartment,
+          );
+        }
+
         await users.upsertLocalProfile({
           id: userId,
           username: profile?.username || centerUser?.username,
@@ -491,16 +603,14 @@ export function registerSystemRoutes(app, { pool, wrap, requireAuth }) {
               ? String(req.body.display_name || "").trim()
               : profile?.display_name ||
                 `${centerUser?.first_name || ""} ${centerUser?.last_name || ""}`.trim(),
-          department:
-            req.body?.department !== undefined
-              ? String(req.body.department || "").trim() || null
-              : profile?.department || null,
+          department: nextDepartment,
           isActive: nextActive,
         });
         await pool.query(
           `UPDATE cms_memberships SET is_active = ? WHERE user_id = ?`,
           [nextActive ? 1 : 0, userId],
         );
+        users.invalidateCache(userId);
       }
 
       const member = await users.findById(userId);
@@ -530,6 +640,7 @@ export function registerSystemRoutes(app, { pool, wrap, requireAuth }) {
         throw httpError(400, "ไม่สามารถถอนสิทธิ์ CMS ของตัวเองได้");
       }
       await pool.query(`DELETE FROM cms_memberships WHERE user_id = ?`, [userId]);
+      users.invalidateCache(userId);
       res.json({ ok: true });
     }),
   );

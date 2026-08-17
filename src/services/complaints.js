@@ -1,20 +1,53 @@
 import { toDateOnly } from "../validators/common.js";
 import { canCsWork, canDepartmentWork, canQaWork, isCmsAdmin } from "../core/authz.js";
+import { canonicalizeDepartmentName } from "../utils/department-map.js";
+import {
+  canHandleDepartmentStep,
+  CS_AUDIENCE_DEPARTMENTS,
+} from "../utils/department-permissions.js";
 import { normalizePlanForm } from "./plan-form.js";
+import {
+  joinProblemNames,
+  parseProblemNames,
+  problemNamesOf,
+} from "../utils/problem-names.js";
+import { replaceProblemsSafe, updateRecordFields } from "../repositories/record-problems.js";
 
 const TEXT = "text";
 const NUMBER = "number";
 const DATE = "date";
 const MASTER = "master";
 
+/**
+ * Keep AP document numbers unique under concurrent saves.
+ * Prefer the value from the form when free; otherwise mint the next AP{YY}-NNN.
+ * Persists inside the lock so the number is reserved before other savers run.
+ */
+async function ensureUniqueDocumentNo(complaints, current, updates) {
+  if (!updates || !Object.prototype.hasOwnProperty.call(updates, "document_no")) {
+    return;
+  }
+  const preferred = updates.document_no;
+  if (preferred == null || String(preferred).trim() === "") return;
+  const claimed = await complaints.claimApDocumentNo(String(preferred).trim(), {
+    excludeComplaintId: current?.id,
+    persist: true,
+  });
+  updates.document_no = claimed;
+}
+
 export const COMPLAINT_FIELD_META = {
   cs: {
     problem_name: ["ปัญหา", MASTER],
     ng_qty: ["ของเสีย / NG Qty", NUMBER],
+    cs_remark: ["หมายเหตุ CS", TEXT],
     received_date: ["วันที่รับเรื่อง", DATE],
     document_accepted: ["เอกสาร Action plan", TEXT],
   },
   qa: {
+    problem_name: ["ปัญหา", MASTER],
+    ng_qty: ["ของเสีย / NG Qty", NUMBER],
+    cs_remark: ["หมายเหตุ CS", TEXT],
     reported_by_department_name: ["หน่วยงานที่แจ้งปัญหา", MASTER],
     responsible_department_name: ["หน่วยงานที่รับผิดชอบ", MASTER],
     document_accepted: ["เอกสาร Action plan", TEXT],
@@ -64,7 +97,7 @@ const STATUS_CONFIG = {
 };
 
 const REQUIRED_ON_SUBMIT = {
-  cs: ["problem_name", "ng_qty", "received_date", "document_accepted"],
+  cs: ["problem_name", "received_date", "document_accepted"],
   qa: ["reported_by_department_name", "responsible_department_name", "document_accepted"],
   department: ["cause", "correction", "prevention"],
 };
@@ -96,6 +129,7 @@ function normalize(type, value) {
 }
 
 function toLocalDateOnly(value = new Date()) {
+  if (value == null || value === "") return null;
   const date = value instanceof Date ? value : new Date(value);
   if (Number.isNaN(date.getTime())) return null;
   const year = date.getFullYear();
@@ -130,11 +164,7 @@ function resolveDepartmentDocMeta(current, actor, acceptAt) {
   const csSaleDate =
     toDateOnly(current.doc_cs_sale_date) || toLocalDateOnly(acceptAt);
 
-  const leadEnd = toDateOnly(current.doc_reply_date) || acceptAt;
-  const leadTime =
-    current.lead_time_days == null || current.lead_time_days === ""
-      ? calendarDayDiff(current.qa_submitted_at || forwardDate, leadEnd)
-      : Number(current.lead_time_days);
+  const leadTime = calendarDayDiff(forwardDate, replyDate);
 
   return {
     doc_forward_date: forwardDate,
@@ -158,7 +188,16 @@ function isQaUser(actor) {
 }
 
 function normalizeDeptName(value) {
-  return String(value || "").trim().toUpperCase();
+  return String(canonicalizeDepartmentName(value) || "")
+    .trim()
+    .toUpperCase();
+}
+
+/** Complaint เริ่มจาก CS — ใช้แผนก CS (MKT/SALE) ไม่ใช่แผนก QA ที่กรอกทีหลัง */
+function resolveCsReporterDepartment(department) {
+  const mapped = canonicalizeDepartmentName(department);
+  if (mapped && CS_AUDIENCE_DEPARTMENTS.includes(mapped)) return mapped;
+  return "MKT";
 }
 
 function isResponsibleDepartmentUser(actor, record) {
@@ -174,14 +213,21 @@ function canWork(status, actor, record) {
   if (status === "cs_draft" || status === "pending_qa") {
     return isCsUser(actor) || (status === "pending_qa" && isQaUser(actor));
   }
-  if (status === "qa_review" || status === "qa_confirm") {
+  if (status === "qa_review") {
     return isQaUser(actor);
+  }
+  if (status === "qa_confirm") {
+    return isQaUser(actor) || isResponsibleDepartmentUser(actor, record);
   }
   if (status === "pending_department") {
     return isQaUser(actor) || isResponsibleDepartmentUser(actor, record);
   }
   if (status === "department_action") {
-    return isResponsibleDepartmentUser(actor, record);
+    return (
+      isResponsibleDepartmentUser(actor, record) ||
+      isQaUser(actor) ||
+      isCmsAdmin(actor)
+    );
   }
   return false;
 }
@@ -200,6 +246,29 @@ function display(value) {
 function displayChangeValue(field, value) {
   if (field === "document_accepted") return displayDocumentAccepted(value);
   return display(value);
+}
+
+async function buildProblemUpdates(complaints, current, payload, parsedProblemNames) {
+  if (parsedProblemNames == null) {
+    return { nextProblemIds: null, updates: {}, change: null };
+  }
+  const before = joinProblemNames(problemNamesOf(current));
+  const after = joinProblemNames(parsedProblemNames);
+  const nextProblemIds = await complaints.resolveProblemIds(
+    parsedProblemNames,
+    payload.problem_name_en,
+  );
+  return {
+    nextProblemIds,
+    updates: {
+      problem_names_json: JSON.stringify(parsedProblemNames),
+      problem_id: nextProblemIds[0] || null,
+    },
+    change:
+      before === after
+        ? null
+        : { field: "problem_name", label: "ปัญหา", before, after },
+  };
 }
 
 export function createComplaintService(complaints, activityLogs) {
@@ -235,7 +304,17 @@ export function createComplaintService(complaints, activityLogs) {
           error.status = 403;
           throw error;
         }
-        if ((status === "qa_confirm" || status === "completed") && !isQaUser(actor) && !isCmsAdmin(actor)) {
+        if (
+          status === "qa_confirm" &&
+          !isQaUser(actor) &&
+          !isCmsAdmin(actor) &&
+          !isResponsibleDepartmentUser(actor, current)
+        ) {
+          const error = new Error("ไม่มีสิทธิ์จัดวางรูปใน PDF");
+          error.status = 403;
+          throw error;
+        }
+        if (status === "completed" && !isQaUser(actor) && !isCmsAdmin(actor)) {
           const error = new Error("เฉพาะ QA ที่จัดวางรูปใน PDF ได้ในขั้นตอนนี้");
           error.status = 403;
           throw error;
@@ -276,10 +355,182 @@ export function createComplaintService(complaints, activityLogs) {
       }
 
       if (status === "completed") {
+        // ย้อนกลับไปขั้นหน่วยงาน (ทดสอบ / แก้เอกสาร Action Plan)
+        if (
+          payload.action === "reopen_department" &&
+          (isQaUser(actor) || isCmsAdmin(actor))
+        ) {
+          if (String(current.document_accepted || "").toUpperCase() !== "P") {
+            const error = new Error(
+              "ย้อนไปขั้นหน่วยงานได้เฉพาะกรณีรับเอกสาร (P)",
+            );
+            error.status = 400;
+            throw error;
+          }
+          await complaints.updateById(id, {
+            workflow_status: "department_action",
+            updated_by: actor.id,
+          });
+          await activityLogs.create({
+            userId: actor.id,
+            username: actor.username,
+            displayName: actor.display_name,
+            department: actor.department,
+            action: "update",
+            entityType: "complaint_record",
+            entityId: id,
+            summary: `ย้อน Complaint ${current.pdr_no || `#${id}`} ไปขั้นหน่วยงาน`,
+            changes: [
+              {
+                field: "workflow_status",
+                label: "สถานะ",
+                before: "completed",
+                after: "department_action",
+              },
+            ],
+          });
+          return {
+            record: await complaints.findById(id),
+            changed: true,
+            action: "reopen_department",
+          };
+        }
+
+        // QA ปรับสาเหตุ/รูปใน PDF หลังปิดงานได้ — เฉพาะกรณีรับเอกสาร (P)
+        if (payload.action === "save" && (isQaUser(actor) || isCmsAdmin(actor))) {
+          if (String(current.document_accepted || "").toUpperCase() !== "P") {
+            const error = new Error(
+              "แก้สาเหตุ/แก้ไข/ป้องกัน ได้เฉพาะกรณีรับเอกสาร",
+            );
+            error.status = 400;
+            throw error;
+          }
+          const fieldUpdates = {};
+          const changes = [];
+          const qaConfirmEditable = ["cause", "correction", "prevention", "remark"];
+          for (const key of qaConfirmEditable) {
+            if (!Object.prototype.hasOwnProperty.call(payload, key)) continue;
+            const [label, type] = COMPLAINT_FIELD_META.department[key];
+            const before = normalize(type, current[key]);
+            const after = normalize(type, payload[key]);
+            if (before === after) continue;
+            fieldUpdates[key] = after;
+            changes.push({ field: key, label, before, after });
+          }
+
+          let planChanged = false;
+          if (
+            String(current.document_accepted || "").toUpperCase() === "P" &&
+            Object.prototype.hasOwnProperty.call(payload, "pdf_image_slots")
+          ) {
+            const previousPlan = normalizePlanForm(current.plan_form_json);
+            const nextPlan = normalizePlanForm({
+              ...previousPlan,
+              pdfImageSlots: payload.pdf_image_slots || {},
+            });
+            if (
+              JSON.stringify(previousPlan.pdfImageSlots) !==
+              JSON.stringify(nextPlan.pdfImageSlots)
+            ) {
+              await complaints.updatePlanFormJson(id, nextPlan);
+              planChanged = true;
+              changes.push({
+                field: "pdf_image_slots",
+                label: "ตำแหน่งรูปใน PDF",
+                before: JSON.stringify(previousPlan.pdfImageSlots || {}),
+                after: JSON.stringify(nextPlan.pdfImageSlots || {}),
+              });
+            }
+          }
+
+          if (!changes.length) {
+            return { record: current, changed: false, action: "save" };
+          }
+          if (Object.keys(fieldUpdates).length) {
+            fieldUpdates.updated_by = actor.id;
+            await complaints.updateById(id, fieldUpdates);
+          }
+
+          await activityLogs.create({
+            userId: actor.id,
+            username: actor.username,
+            displayName: actor.display_name,
+            department: actor.department,
+            action: "update",
+            entityType: "complaint_record",
+            entityId: id,
+            summary: `QA ปรับเอกสารหลังปิดงาน ${current.pdr_no || `#${id}`} (${changes.length} ช่อง)`,
+            changes: changes.map((change) => ({
+              ...change,
+              before: displayChangeValue(change.field, change.before),
+              after: displayChangeValue(change.field, change.after),
+            })),
+          });
+          return {
+            record: await complaints.findById(id),
+            changed: true,
+            action: "save",
+          };
+        }
+
         const error = new Error("รายการนี้ Confirm และปิดงานแล้ว");
         error.status = 409;
         throw error;
       }
+
+      // หน่วยงานแก้ CAPA ได้จนกว่า QA จะ Confirm — ตรวจก่อน canWork
+      // เพราะ Step นี้เป็นของ QA แต่ยังอนุญาตหน่วยงานที่รับผิดชอบให้แก้ได้
+      if (status === "qa_confirm" && payload.action === "dept_update") {
+        if (
+          !isResponsibleDepartmentUser(actor, current) &&
+          !isQaUser(actor) &&
+          !isCmsAdmin(actor)
+        ) {
+          const error = new Error(
+            `เฉพาะหน่วยงานที่รับผิดชอบ (${current.responsible_department_name || "-"}) เท่านั้นที่แก้ไขได้`,
+          );
+          error.status = 403;
+          throw error;
+        }
+
+        const fieldMeta = COMPLAINT_FIELD_META.department;
+        const updates = { updated_by: actor.id };
+        const changes = [];
+        for (const [key, [label, type]] of Object.entries(fieldMeta)) {
+          if (!Object.prototype.hasOwnProperty.call(payload, key)) continue;
+          const before = normalize(type, current[key]);
+          const after = normalize(type, payload[key]);
+          if (before === after) continue;
+          updates[key] = after;
+          changes.push({ field: key, label, before, after });
+        }
+
+        if (changes.length) {
+          await complaints.updateById(id, updates);
+          await activityLogs.create({
+            userId: actor.id,
+            username: actor.username,
+            displayName: actor.display_name,
+            department: actor.department,
+            action: "update",
+            entityType: "complaint_record",
+            entityId: id,
+            summary: `หน่วยงานแก้ไขข้อมูลก่อน QA Confirm ${current.pdr_no || `#${id}`}`,
+            changes: changes.map((change) => ({
+              ...change,
+              before: displayChangeValue(change.field, change.before),
+              after: displayChangeValue(change.field, change.after),
+            })),
+          });
+        }
+
+        return {
+          record: await complaints.findById(id),
+          changed: changes.length > 0,
+          action: "save",
+        };
+      }
+
       if (!canWork(status, actor, current)) {
         const error = new Error("บัญชีนี้ไม่มีสิทธิ์กรอกข้อมูลใน Step ปัจจุบัน");
         error.status = 403;
@@ -287,8 +538,15 @@ export function createComplaintService(complaints, activityLogs) {
       }
 
       // เติมช่องเอกสารอัตโนมัติถ้าว่าง (กรณีรับเรื่องก่อนมีฟีเจอร์ หรือ backend ยังไม่รีสตาร์ท)
-      if (status === "department_action" && payload.action === "ensure_doc_fields") {
-        if (!isResponsibleDepartmentUser(actor, current)) {
+      if (
+        (status === "department_action" || status === "qa_confirm") &&
+        payload.action === "ensure_doc_fields"
+      ) {
+        if (
+          !isResponsibleDepartmentUser(actor, current) &&
+          !isQaUser(actor) &&
+          !isCmsAdmin(actor)
+        ) {
           const error = new Error(
             `เฉพาะหน่วยงานที่รับผิดชอบ (${current.responsible_department_name || "-"}) เท่านั้น`,
           );
@@ -482,6 +740,11 @@ export function createComplaintService(complaints, activityLogs) {
           error.status = 400;
           throw error;
         }
+        if (!isQaUser(actor) && !isCmsAdmin(actor)) {
+          const error = new Error("เฉพาะ QA ที่ยืนยันหรือแก้ไขในขั้นตอนนี้ได้");
+          error.status = 403;
+          throw error;
+        }
 
         const isConfirm = payload.action === "confirm";
         const updates = {
@@ -501,16 +764,43 @@ export function createComplaintService(complaints, activityLogs) {
           });
         }
 
-        // QA ปรับแก้สาเหตุ/แก้ไข/ป้องกัน/หมายเหตุ ได้ก่อนปิดงาน
-        const qaConfirmEditable = ["cause", "correction", "prevention", "remark"];
-        for (const key of qaConfirmEditable) {
-          if (!Object.prototype.hasOwnProperty.call(payload, key)) continue;
-          const [label, type] = COMPLAINT_FIELD_META.department[key];
-          const before = normalize(type, current[key]);
-          const after = normalize(type, payload[key]);
-          if (before === after) continue;
-          updates[key] = after;
-          changes.push({ field: key, label, before, after });
+        // QA ปรับแก้สาเหตุ/แก้ไข/ป้องกัน/หมายเหตุ ได้ก่อนปิดงาน — เฉพาะกรณีรับเอกสาร (P)
+        if (String(current.document_accepted || "").toUpperCase() === "P") {
+          const qaConfirmEditable = ["cause", "correction", "prevention", "remark"];
+          for (const key of qaConfirmEditable) {
+            if (!Object.prototype.hasOwnProperty.call(payload, key)) continue;
+            const [label, type] = COMPLAINT_FIELD_META.department[key];
+            const before = normalize(type, current[key]);
+            const after = normalize(type, payload[key]);
+            if (before === after) continue;
+            updates[key] = after;
+            changes.push({ field: key, label, before, after });
+          }
+        } else if (
+          !isConfirm &&
+          ["cause", "correction", "prevention", "remark"].some((key) =>
+            Object.prototype.hasOwnProperty.call(payload, key),
+          )
+        ) {
+          const error = new Error(
+            "แก้สาเหตุ/แก้ไข/ป้องกัน ได้เฉพาะกรณีรับเอกสาร",
+          );
+          error.status = 400;
+          throw error;
+        }
+
+        const parsedProblemNames = parseProblemNames(payload);
+        let nextProblemIds = null;
+        if (parsedProblemNames != null) {
+          const built = await buildProblemUpdates(
+            complaints,
+            current,
+            payload,
+            parsedProblemNames,
+          );
+          nextProblemIds = built.nextProblemIds;
+          Object.assign(updates, built.updates);
+          if (built.change) changes.push(built.change);
         }
 
         let planChanged = false;
@@ -538,11 +828,15 @@ export function createComplaintService(complaints, activityLogs) {
           }
         }
 
-        if (!isConfirm && changes.length === 0) {
+        if (!isConfirm && changes.length === 0 && nextProblemIds == null) {
           return { record: current, changed: false, action: "save" };
         }
 
+        await ensureUniqueDocumentNo(complaints, current, updates);
         await complaints.updateById(id, updates);
+        if (nextProblemIds != null) {
+          await replaceProblemsSafe(complaints.replaceProblems.bind(complaints), id, nextProblemIds);
+        }
         await activityLogs.create({
           userId: actor.id,
           username: actor.username,
@@ -553,7 +847,7 @@ export function createComplaintService(complaints, activityLogs) {
           entityId: id,
           summary: isConfirm
             ? `QA Confirm Complaint ${current.pdr_no || `#${id}`}`
-            : `QA แก้ไขสาเหตุ/แก้ไข/ป้องกัน Complaint ${current.pdr_no || `#${id}`}`,
+            : `QA แก้ไข Complaint ${current.pdr_no || `#${id}`}`,
           changes: changes.map((change) => ({
             ...change,
             before: displayChangeValue(change.field, change.before),
@@ -567,8 +861,12 @@ export function createComplaintService(complaints, activityLogs) {
         };
       }
 
-      // หลัง QA รับเรื่องแล้ว CS ห้ามแก้
-      if ((status === "cs_draft" || status === "pending_qa") && !isCsUser(actor)) {
+      // ช่วง CS: CS แก้ได้ / QA แก้ได้ตอนรอรับเรื่อง (เช่น ปรับปัญหาให้ตรง Reject)
+      if (
+        (status === "cs_draft" || status === "pending_qa") &&
+        !isCsUser(actor) &&
+        !(status === "pending_qa" && isQaUser(actor))
+      ) {
         const error = new Error("เฉพาะ CS ที่แก้ไขข้อมูลช่วงนี้ได้ หรือ QA กดรับเรื่อง");
         error.status = 403;
         throw error;
@@ -583,8 +881,13 @@ export function createComplaintService(complaints, activityLogs) {
         throw error;
       }
 
-      // หลังหน่วยงานรับเรื่องแล้ว — เฉพาะหน่วยงานที่รับผิดชอบกรอกได้
-      if (status === "department_action" && !isResponsibleDepartmentUser(actor, current)) {
+      // หลังหน่วยงานรับเรื่องแล้ว — หน่วยงานที่รับผิดชอบ หรือ QA (ทดสอบ)
+      if (
+        status === "department_action" &&
+        !isResponsibleDepartmentUser(actor, current) &&
+        !isQaUser(actor) &&
+        !isCmsAdmin(actor)
+      ) {
         const error = new Error(
           `เฉพาะหน่วยงานที่รับผิดชอบ (${current.responsible_department_name || "-"}) เท่านั้นที่กรอกได้`,
         );
@@ -602,8 +905,40 @@ export function createComplaintService(complaints, activityLogs) {
       const fieldMeta = COMPLAINT_FIELD_META[config.group];
       const updates = {};
       const changes = [];
+      const parsedProblemNames = parseProblemNames(payload);
+      let nextProblemIds = null;
+
+      if (
+        parsedProblemNames != null &&
+        !Object.prototype.hasOwnProperty.call(fieldMeta, "problem_name") &&
+        (isQaUser(actor) || isCmsAdmin(actor))
+      ) {
+        const built = await buildProblemUpdates(
+          complaints,
+          current,
+          payload,
+          parsedProblemNames,
+        );
+        nextProblemIds = built.nextProblemIds;
+        Object.assign(updates, built.updates);
+        if (built.change) changes.push(built.change);
+      }
 
       for (const [key, [label, type]] of Object.entries(fieldMeta)) {
+        if (key === "problem_name") {
+          if (parsedProblemNames == null) continue;
+          const before = joinProblemNames(problemNamesOf(current));
+          const after = joinProblemNames(parsedProblemNames);
+          nextProblemIds = await complaints.resolveProblemIds(
+            parsedProblemNames,
+            payload.problem_name_en,
+          );
+          updates.problem_names_json = JSON.stringify(parsedProblemNames);
+          updates.problem_id = nextProblemIds[0] || null;
+          if (before === after) continue;
+          changes.push({ field: key, label, before, after });
+          continue;
+        }
         if (!Object.prototype.hasOwnProperty.call(payload, key)) continue;
         const before =
           key === "document_accepted"
@@ -643,10 +978,8 @@ export function createComplaintService(complaints, activityLogs) {
           updates.reported_by_department_id = await complaints.resolveDepartmentId(after);
         } else if (key === "responsible_department_name") {
           updates.responsible_department_id = await complaints.resolveDepartmentId(after);
-        } else if (key === "problem_name") {
-          updates.problem_id = await complaints.resolveProblemId(after, payload.problem_name_en);
         } else if (key === "problem_name_en") {
-          if (!Object.prototype.hasOwnProperty.call(payload, "problem_name")) {
+          if (parsedProblemNames == null && !Object.prototype.hasOwnProperty.call(payload, "problem_name")) {
             updates.problem_id = await complaints.resolveProblemId(current.problem_name, after);
           }
         } else {
@@ -662,9 +995,9 @@ export function createComplaintService(complaints, activityLogs) {
             Object.prototype.hasOwnProperty.call(updates, key)
               ? updates[key]
               : key === "problem_name"
-                ? (Object.prototype.hasOwnProperty.call(updates, "problem_id")
-                  ? updates.problem_id
-                  : current.problem_id || current.problem_name)
+                ? (nextProblemIds != null
+                  ? nextProblemIds[0]
+                  : current.problem_id || current.problem_name || (current.problem_names || [])[0])
                 : key === "reported_by_department_name"
                   ? (Object.prototype.hasOwnProperty.call(updates, "reported_by_department_id")
                     ? updates.reported_by_department_id
@@ -702,6 +1035,19 @@ export function createComplaintService(complaints, activityLogs) {
                 throw error;
               }
             }
+            const responsibleName = Object.prototype.hasOwnProperty.call(
+              payload,
+              "responsible_department_name",
+            )
+              ? normalize(MASTER, payload.responsible_department_name)
+              : current.responsible_department_name;
+            if (!canHandleDepartmentStep(responsibleName)) {
+              const error = new Error(
+                "หน่วยงานที่รับผิดชอบต้องเป็นแผนกที่รับเรื่องขั้นหน่วยงานได้ (เช่น PD, ENG, WH) — ไม่ใช่ MKT, SALE, QA หรือ QC",
+              );
+              error.status = 400;
+              throw error;
+            }
           }
           nextStatus = resolveQaNextStatus(qaDocumentAccepted);
         }
@@ -716,6 +1062,23 @@ export function createComplaintService(complaints, activityLogs) {
         }
         updates[config.submittedBy] = actor.id;
         updates[config.submittedAt] = new Date();
+
+        // CS แจ้งปัญหา — บันทึกหน่วยงานที่แจ้งจากแผนก CS (ไม่รอ QA กรอก)
+        if (
+          config.group === "cs" &&
+          !current.reported_by_department_id &&
+          !Object.prototype.hasOwnProperty.call(updates, "reported_by_department_id")
+        ) {
+          const reporterName = resolveCsReporterDepartment(actor.department);
+          updates.reported_by_department_id =
+            await complaints.resolveDepartmentId(reporterName);
+          changes.push({
+            field: "reported_by_department_name",
+            label: "หน่วยงานที่แจ้งปัญหา",
+            before: current.reported_by_department_name,
+            after: reporterName,
+          });
+        }
 
         // วันที่ส่งต่อเอกสาร = วันสุดท้ายที่ QA กด Submit (อัปเดตได้จนกว่าหน่วยงานจะรับเรื่อง)
         if (
@@ -736,11 +1099,57 @@ export function createComplaintService(complaints, activityLogs) {
         }
       }
 
+      // นับ 3 วันตั้งแต่วันที่ CS/QA เลือกรับเอกสาร (P)
+      const prevAccepted = normalizeDocumentAccepted(current.document_accepted);
+      const nextAccepted = Object.prototype.hasOwnProperty.call(
+        updates,
+        "document_accepted",
+      )
+        ? updates.document_accepted
+        : prevAccepted;
+
+      if (nextAccepted === "P" && prevAccepted !== "P") {
+        updates.document_accepted_at = new Date();
+        updates.document_deadline_warned_on = null;
+        changes.push({
+          field: "document_accepted_at",
+          label: "วันเริ่มนับกำหนดส่งเอกสาร",
+          before: current.document_accepted_at,
+          after: updates.document_accepted_at,
+        });
+      } else if (
+        nextAccepted === "P" &&
+        !current.document_accepted_at &&
+        (isSubmit || Object.keys(updates).length > 0)
+      ) {
+        updates.document_accepted_at = new Date();
+      } else if (nextAccepted === "O" && prevAccepted === "P") {
+        updates.document_accepted_at = null;
+        updates.document_deadline_warned_on = null;
+      }
+
       if (!Object.keys(updates).length) {
+        if (nextProblemIds != null) {
+          await replaceProblemsSafe(complaints.replaceProblems.bind(complaints), id, nextProblemIds);
+          return {
+            record: await complaints.findById(id),
+            changed: true,
+            action: isSubmit ? "submit" : "update",
+          };
+        }
         return { record: current, changed: false, action: null };
       }
       updates.updated_by = actor.id;
-      await complaints.updateById(id, updates);
+      await ensureUniqueDocumentNo(complaints, current, updates);
+      // If claim bumped the number, keep activity log "after" in sync.
+      if (Object.prototype.hasOwnProperty.call(updates, "document_no")) {
+        const change = changes.find((row) => row.field === "document_no");
+        if (change) change.after = updates.document_no;
+      }
+      await updateRecordFields(complaints.updateById.bind(complaints), id, updates);
+      if (nextProblemIds != null) {
+        await replaceProblemsSafe(complaints.replaceProblems.bind(complaints), id, nextProblemIds);
+      }
 
       const action = isSubmit ? "submit" : "update";
       await activityLogs.create({

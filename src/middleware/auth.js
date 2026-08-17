@@ -3,7 +3,7 @@ import { config } from "../core/config.js";
 import { createUserRepository } from "../repositories/users.js";
 
 /**
- * JWT proves identity; each request reloads CMS roles/permissions from DB.
+ * JWT proves identity; CMS roles/permissions come from DB (short TTL in users repo).
  */
 export function createAuth(pool) {
   const users = createUserRepository(pool);
@@ -32,6 +32,11 @@ export function createAuth(pool) {
         sub: user.id,
         id: user.id,
         username: user.username,
+        first_name: user.first_name || null,
+        last_name: user.last_name || null,
+        email: user.email || null,
+        telegram_id: user.telegram_id || null,
+        telegram_chat_id: user.telegram_chat_id || null,
         display_name: user.display_name,
         role: user.role,
         roles: user.roles,

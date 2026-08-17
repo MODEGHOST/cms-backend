@@ -1,5 +1,16 @@
 import { config } from "../core/config.js";
 import { hasPermission, isCmsAdmin } from "../core/authz.js";
+import { canonicalizeDepartmentName } from "../utils/department-map.js";
+import { mergeStaffPermissions } from "../utils/department-permissions.js";
+import { createTtlCache } from "../utils/ttl-cache.js";
+
+const authHydrateCache =
+  Number(config.authUserCacheTtlSec || 0) > 0
+    ? createTtlCache({
+        ttlMs: Number(config.authUserCacheTtlSec) * 1000,
+        maxEntries: 256,
+      })
+    : null;
 
 export function centerUserTableSql(cfg = config) {
   return `\`${cfg.sharedDbName}\`.\`${cfg.centerUserTable}\``;
@@ -14,10 +25,7 @@ function displayNameFromCenter(row) {
 const ROLE_RANK = {
   developer: 110,
   admin: 100,
-  qc: 80,
-  qa: 70,
-  cs: 60,
-  department: 40,
+  staff: 50,
   viewer: 10,
 };
 
@@ -38,6 +46,11 @@ function toAppUser(row, { roles = [], permissions = [] } = {}) {
   return {
     id: Number(row.id),
     username: row.username,
+    first_name: row.first_name || null,
+    last_name: row.last_name || null,
+    email: row.email || null,
+    telegram_id: row.telegram_id || null,
+    telegram_chat_id: row.telegram_chat_id || null,
     display_name: row.display_name || displayNameFromCenter(row),
     role: pickPrimaryRole(roleNames) || "viewer",
     roles: roleNames,
@@ -55,6 +68,11 @@ function toAppUser(row, { roles = [], permissions = [] } = {}) {
  */
 export function createUserRepository(pool) {
   const center = centerUserTableSql();
+
+  function invalidateCache(userId) {
+    if (!authHydrateCache || userId == null) return;
+    authHydrateCache.del(`id:${Number(userId)}`);
+  }
 
   async function loadRolesAndPermissions(userId) {
     const [roleRows] = await pool.query(
@@ -90,7 +108,13 @@ export function createUserRepository(pool) {
         { roles: [], permissions: [] },
       );
     }
-    const { roles, permissions } = await loadRolesAndPermissions(row.id);
+    const { roles, permissions: rolePermissions } =
+      await loadRolesAndPermissions(row.id);
+    const permissions = mergeStaffPermissions(
+      roles,
+      rolePermissions,
+      row.department,
+    );
     return toAppUser(
       { ...row, display_name },
       { roles, permissions },
@@ -104,6 +128,9 @@ export function createUserRepository(pool) {
       c.password_hash,
       c.first_name,
       c.last_name,
+      c.email,
+      c.telegram_id,
+      c.telegram_chat_id,
       c.status AS shared_status,
       COALESCE(p.display_name, NULL) AS local_display_name,
       COALESCE(p.department, c.department) AS department,
@@ -118,7 +145,19 @@ export function createUserRepository(pool) {
     LEFT JOIN cms_memberships m ON m.user_id = c.id
   `;
 
+  async function loadById(id) {
+    const [rows] = await pool.query(
+      `${baseSelect}
+       WHERE c.id = ?
+       LIMIT 1`,
+      [id],
+    );
+    return hydrate(rows[0]);
+  }
+
   return {
+    invalidateCache,
+
     async findByUsername(username) {
       const [rows] = await pool.query(
         `${baseSelect}
@@ -126,17 +165,15 @@ export function createUserRepository(pool) {
          LIMIT 1`,
         [username],
       );
-      return hydrate(rows[0]);
+      const user = await hydrate(rows[0]);
+      // Login must see fresh membership/roles — bust any stale cache entry.
+      if (user?.id) invalidateCache(user.id);
+      return user;
     },
 
     async findById(id) {
-      const [rows] = await pool.query(
-        `${baseSelect}
-         WHERE c.id = ?
-         LIMIT 1`,
-        [id],
-      );
-      return hydrate(rows[0]);
+      if (!authHydrateCache) return loadById(id);
+      return authHydrateCache.getOrSet(`id:${Number(id)}`, () => loadById(id));
     },
 
     async countMemberships() {
@@ -169,6 +206,7 @@ export function createUserRepository(pool) {
          VALUES (?, ?)`,
         [userId, role.id],
       );
+      invalidateCache(userId);
     },
 
     async setRoles(userId, roleNames = []) {
@@ -184,6 +222,7 @@ export function createUserRepository(pool) {
       for (const roleName of roleNames) {
         await this.assignRole(userId, roleName);
       }
+      invalidateCache(userId);
     },
 
     /**
@@ -208,16 +247,14 @@ export function createUserRepository(pool) {
       const cleanEmail =
         email || `${cleanUsername.toLowerCase()}@cms.local`;
 
-      // Map legacy admin/staff to RBAC role names.
-      let roleName = role;
-      if (role === "staff") {
-        const dept = String(department || "").trim().toUpperCase();
-        if (dept === "CS" || dept === "CUSTOMER SERVICE") roleName = "cs";
-        else if (dept === "QA") roleName = "qa";
-        else if (dept === "QC") roleName = "qc";
-        else if (dept) roleName = "department";
-        else roleName = "viewer";
+      // Access-level roles only; workflow comes from department at hydrate.
+      const allowed = new Set(["developer", "admin", "staff", "viewer"]);
+      let roleName = String(role || "viewer").trim();
+      if (roleName === "cs" || roleName === "qa" || roleName === "qc" || roleName === "department") {
+        roleName = "staff";
       }
+      if (!allowed.has(roleName)) roleName = "staff";
+      const cleanDepartment = canonicalizeDepartmentName(department);
 
       const [[existing]] = await pool.query(
         `SELECT id FROM ${center} WHERE username = ? LIMIT 1`,
@@ -238,7 +275,7 @@ export function createUserRepository(pool) {
             cleanUsername,
             telegramId || null,
             passwordHash,
-            department,
+            cleanDepartment,
           ],
         );
         centerId = Number(result.insertId);
@@ -247,7 +284,7 @@ export function createUserRepository(pool) {
           `UPDATE ${center}
            SET password_hash = ?, department = COALESCE(?, department)
            WHERE id = ?`,
-          [passwordHash, department, centerId],
+          [passwordHash, cleanDepartment, centerId],
         );
       }
 
@@ -260,7 +297,7 @@ export function createUserRepository(pool) {
            display_name = VALUES(display_name),
            department = VALUES(department),
            is_active = 1`,
-        [centerId, cleanUsername, cleanDisplay, department],
+        [centerId, cleanUsername, cleanDisplay, cleanDepartment],
       );
 
       await this.setRoles(centerId, [roleName]);
@@ -291,6 +328,62 @@ export function createUserRepository(pool) {
           isActive ? 1 : 0,
         ],
       );
+      invalidateCache(id);
+    },
+
+    /**
+     * Find active members whose department is in `departmentNames`.
+     * When `matchDepartmentId` is set, also require that department id.
+     */
+    async findByDepartments(departmentNames, matchDepartmentId = null) {
+      const names = (departmentNames || [])
+        .map((n) => canonicalizeDepartmentName(n))
+        .filter(Boolean);
+      if (!names.length && !matchDepartmentId) return [];
+
+      if (matchDepartmentId) {
+        const [rows] = await pool.query(
+          `SELECT DISTINCT u.id, u.username, u.department,
+                  COALESCE(cu.telegram_chat_id, cu.telegram_id) AS telegram_id
+           FROM users u
+           JOIN cms_memberships m ON m.user_id = u.id AND COALESCE(m.is_active, 1) = 1
+           LEFT JOIN ${center} cu ON cu.id = u.id
+           WHERE u.is_active = 1
+             AND u.department = (SELECT name FROM departments WHERE id = ?)`,
+          [matchDepartmentId],
+        );
+        return rows;
+      }
+
+      const [rows] = await pool.query(
+        `SELECT DISTINCT u.id, u.username, u.department,
+                COALESCE(cu.telegram_chat_id, cu.telegram_id) AS telegram_id
+         FROM users u
+         JOIN cms_memberships m ON m.user_id = u.id AND COALESCE(m.is_active, 1) = 1
+         LEFT JOIN ${center} cu ON cu.id = u.id
+         WHERE u.is_active = 1 AND u.department IN (?)`,
+        [names],
+      );
+      return rows;
+    },
+
+    /** @deprecated use findByDepartments — kept for older call sites during transition */
+    async findByRolesAndDepartment(roleNames, departmentId) {
+      const legacyToDepts = {
+        cs: ["MKT", "SALE"],
+        qa: ["QA"],
+        qc: ["QC"],
+        department: [],
+      };
+      const depts = [];
+      for (const role of roleNames || []) {
+        const mapped = legacyToDepts[role];
+        if (mapped) depts.push(...mapped);
+      }
+      if ((roleNames || []).includes("department") && departmentId) {
+        return this.findByDepartments([], departmentId);
+      }
+      return this.findByDepartments([...new Set(depts)], null);
     },
 
     hasPermission,

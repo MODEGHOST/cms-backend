@@ -1,6 +1,7 @@
-export function parsePagination(query = {}) {
+export function parsePagination(query = {}, { maxPageSize = 100 } = {}) {
   const page = Math.max(1, Number(query.page) || 1);
-  const pageSize = Math.min(5000, Math.max(1, Number(query.pageSize) || 20));
+  const cap = Math.max(1, Number(maxPageSize) || 100);
+  const pageSize = Math.min(cap, Math.max(1, Number(query.pageSize) || 20));
   const offset = (page - 1) * pageSize;
   return { page, pageSize, offset };
 }

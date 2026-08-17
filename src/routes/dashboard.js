@@ -1,5 +1,7 @@
 import { createComplaintDashboardService } from "../services/complaint-dashboard.js";
 import { createDashboardService } from "../services/dashboard.js";
+import { createDeptTargetRateService } from "../services/dept-target-rate.js";
+import { createOrderRateService } from "../services/order-rate.js";
 
 /** Forward the service's own 400/404 instead of bubbling up as a 500. */
 function handled(handler) {
@@ -22,6 +24,8 @@ function handled(handler) {
 export function registerDashboardRoutes(app, { pool, wrap, requireAuth }) {
   const dashboard = createDashboardService(pool);
   const complaintDashboard = createComplaintDashboardService(pool);
+  const orderRate = createOrderRateService(pool);
+  const deptTargetRate = createDeptTargetRateService(pool);
 
   app.get(
     "/api/dashboard/reject",
@@ -65,6 +69,12 @@ export function registerDashboardRoutes(app, { pool, wrap, requireAuth }) {
         throw err;
       }
     }),
+  );
+
+  app.get(
+    "/api/dashboard/reject/summary-table",
+    requireAuth,
+    wrap(handled((query) => dashboard.getSummaryTable(query))),
   );
 
   app.get(
@@ -153,6 +163,34 @@ export function registerDashboardRoutes(app, { pool, wrap, requireAuth }) {
   );
 
   app.get(
+    "/api/dashboard/reject/order-rate",
+    requireAuth,
+    wrap(handled((query) => orderRate.getRejectOrderRate(query))),
+  );
+
+  app.get(
+    "/api/dashboard/reject/dept-target-rate",
+    requireAuth,
+    wrap(handled((query) => deptTargetRate.getRejectDeptTargetRate(query))),
+  );
+
+  app.put(
+    "/api/dashboard/reject/dept-target-rate/targets",
+    requireAuth,
+    wrap(async (req, res) => {
+      try {
+        res.json(await deptTargetRate.updateRejectTargets(req.body || {}));
+      } catch (err) {
+        if (err.status === 400 || err.status === 404) {
+          res.status(err.status).json({ message: err.message });
+          return;
+        }
+        throw err;
+      }
+    }),
+  );
+
+  app.get(
     "/api/dashboard/complaint",
     requireAuth,
     wrap(handled((query) => complaintDashboard.getSummary(query))),
@@ -186,5 +224,33 @@ export function registerDashboardRoutes(app, { pool, wrap, requireAuth }) {
     "/api/dashboard/complaint/entity-detail",
     requireAuth,
     wrap(handled((query) => complaintDashboard.getEntityDetail(query))),
+  );
+
+  app.get(
+    "/api/dashboard/complaint/order-rate",
+    requireAuth,
+    wrap(handled((query) => orderRate.getComplaintOrderRate(query))),
+  );
+
+  app.get(
+    "/api/dashboard/complaint/dept-target-rate",
+    requireAuth,
+    wrap(handled((query) => deptTargetRate.getComplaintDeptTargetRate(query))),
+  );
+
+  app.put(
+    "/api/dashboard/complaint/dept-target-rate/targets",
+    requireAuth,
+    wrap(async (req, res) => {
+      try {
+        res.json(await deptTargetRate.updateComplaintTargets(req.body || {}));
+      } catch (err) {
+        if (err.status === 400 || err.status === 404) {
+          res.status(err.status).json({ message: err.message });
+          return;
+        }
+        throw err;
+      }
+    }),
   );
 }

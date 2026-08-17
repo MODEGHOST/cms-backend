@@ -8,7 +8,18 @@ import {
   parseStringList,
   resolveDateRange,
   resolveTrendGrain,
+  formatDisplayDate,
+  headlineCompareRange,
+  likeForLikePair,
+  PERIOD_LABELS,
+  pulseVerdict,
 } from "./dashboard-period.js";
+import { config } from "../core/config.js";
+import { createConcurrencyGate } from "../utils/concurrency-gate.js";
+import { createTtlCache } from "../utils/ttl-cache.js";
+
+/** Short TTL — identical query params return the same payload (no SQL rewrite). */
+const dashboardPayloadCache = createTtlCache({ ttlMs: 60_000, maxEntries: 64 });
 
 /** Column that absorbs rejects with no machine, or a machine removed from Master. */
 const MACHINE_OTHER_KEY = "machine_other";
@@ -19,6 +30,61 @@ const MACHINE_COMPARISON_BUCKETS = {
   week: { options: [4, 8, 12], default: 4 },
   month: { options: [3, 6, 12], default: 6 },
 };
+
+/** How many buckets the Reject summary comparison table may show. */
+const REJECT_SUMMARY_BUCKETS = {
+  day: { options: [7, 14, 30], default: 14 },
+  week: { options: [4, 8, 12], default: 4 },
+  month: { options: [3, 6, 12], default: 3 },
+};
+
+const REJECT_SUMMARY_DIMENSIONS = {
+  department: {
+    label: "หน่วยงาน",
+    table: "departments",
+    alias: "d",
+    column: "department_id",
+  },
+  problem: {
+    label: "ปัญหา",
+    table: "problems",
+    alias: "p",
+    column: "problem_id",
+  },
+  company: {
+    label: "ลูกค้า",
+    table: "companies",
+    alias: "c",
+    column: "company_id",
+  },
+  machine: {
+    label: "เครื่องจักร",
+    table: "machines",
+    alias: "m",
+    column: "machine_id",
+  },
+};
+
+const REJECT_AMOUNT_SQL = `CASE
+  WHEN rr.claim_sheet_qty IS NULL OR rr.price_per_sheet IS NULL THEN 0
+  ELSE rr.claim_sheet_qty * rr.price_per_sheet
+END`;
+
+function rejectVerdict(latest, baseline) {
+  if (baseline <= 0) return latest > 0 ? "worse" : "flat";
+  const ratio = latest / baseline;
+  if (ratio <= 0.9) return "improved";
+  if (ratio >= 1.1) return "worse";
+  return "flat";
+}
+
+async function resolveRejectDataAnchor(pool, { whereSql, params }, range) {
+  const [[row]] = await pool.query(
+    `SELECT MAX(rr.reject_received_date) AS max_date FROM reject_records rr ${whereSql}`,
+    params,
+  );
+  return normalizeDate(row?.max_date) || anchorNotInFuture(range).to;
+}
 
 /**
  * Dashboard aggregations — all filtering happens in SQL on the backend.
@@ -167,8 +233,9 @@ export function createDashboardService(pool) {
        LEFT JOIN problems p ON p.id = rr.problem_id
        LEFT JOIN companies c ON c.id = rr.company_id
        ${whereSql}
-       ORDER BY d.name ASC, m.name ASC, p.name ASC, rr.id ASC`,
-      params,
+       ORDER BY d.name ASC, m.name ASC, p.name ASC, rr.id ASC
+       LIMIT ?`,
+      [...params, Number(config.dashboardDayDetailLimit) || 500],
     );
 
     const toCountList = (rows) =>
@@ -198,6 +265,7 @@ export function createDashboardService(pool) {
         cause: row.cause || null,
         invoice_no: row.invoice_no || null,
       })),
+      items_limited_to: Number(config.dashboardDayDetailLimit) || 500,
     };
   }
 
@@ -217,9 +285,10 @@ export function createDashboardService(pool) {
     };
   }
 
-  async function buildRejectTrendPayload(range, filterIds, trendGrain) {
+  async function buildRejectTrendPayload(range, filterIds, trendGrain, trendStack = "machine") {
     const { whereSql, params } = buildWhere({ ...range, ...filterIds });
     const bucketExpr = trendBucketSql(trendGrain);
+    const stackMode = trendStack === "department" ? "department" : "machine";
 
     const [[trend], [trendByMachine], [trendByDepartment], [trendByProblem]] = await Promise.all([
       pool.query(
@@ -274,9 +343,15 @@ export function createDashboardService(pool) {
       byDepartment: trendByDepartment,
       byProblem: trendByProblem,
       grain: trendGrain,
+      stackBy: stackMode,
     });
 
-    return { trend: trendRows, trendStackKeys, trendGrain };
+    return {
+      trend: trendRows,
+      trendStackKeys,
+      trendGrain,
+      trendStack: stackMode,
+    };
   }
 
   let filterOptionsCache = null;
@@ -286,10 +361,20 @@ export function createDashboardService(pool) {
   return {
     /** KPI + rank charts only — no trend stacks / filter option lists. */
     async getRejectSummary(query = {}) {
+      const gate = createConcurrencyGate(config.dashboardSqlBatchSize);
+      const q = (sql, params) => gate(() => pool.query(sql, params));
+      const cacheKey = `reject-summary:${JSON.stringify(query || {})}`;
+      const cached = dashboardPayloadCache.get(cacheKey);
+      if (cached != null) return cached;
+
       const range = await resolveEffectiveRange(query);
       const filterIds = resolveFilterIds(query);
       const { machineIds, departmentIds, shifts, jobTypes } = filterIds;
       const { whereSql, params } = buildWhere({ ...range, ...filterIds });
+      const previous = headlineCompareRange(range);
+      const prevFilter = previous
+        ? buildWhere({ ...previous, ...filterIds })
+        : { whereSql: "", params: [] };
       const recordFilters = buildRecordFilters({ ...range, ...filterIds });
       const joinOnSql = recordFilters.clauses.join(" AND ");
       const joinParams = recordFilters.params;
@@ -306,14 +391,19 @@ export function createDashboardService(pool) {
 
       const [
         [[kpi]],
+        [[shipRow]],
         [topProblems],
         [topCompanies],
         [topDepartments],
+        [deptShipRows],
         [allProblems],
         [machines],
         [machineProblemRows],
+        [departmentProblemRows],
+        [problemDepartmentRows],
+        [[prevRow]],
       ] = await Promise.all([
-        pool.query(
+        q(
           `SELECT
              COUNT(*) AS total_count,
              COALESCE(SUM(rr.claim_sheet_qty), 0) AS total_claim_sheet_qty,
@@ -349,18 +439,58 @@ export function createDashboardService(pool) {
            ${whereSql}`,
           params,
         ),
-        pool.query(
-          `SELECT p.id, p.name, COUNT(*) AS count
+        q(
+          `SELECT
+             COALESCE(SUM(claim_qty), 0) AS claim_sheet_qty,
+             COALESCE(SUM(ship_qty), 0) AS actual_ship_qty,
+             COALESCE(SUM(
+               CASE WHEN claim_qty IS NULL OR price_per_sheet IS NULL THEN 0
+               ELSE claim_qty * price_per_sheet END
+             ), 0) AS reject_amount,
+             COALESCE(SUM(
+               CASE WHEN ship_qty IS NULL OR price_per_sheet IS NULL THEN 0
+               ELSE ship_qty * price_per_sheet END
+             ), 0) AS ship_amount,
+             COALESCE(SUM(
+               CASE WHEN claim_qty IS NULL OR weight_per_sheet IS NULL THEN 0
+               ELSE claim_qty * weight_per_sheet END
+             ), 0) AS reject_weight,
+             COALESCE(SUM(
+               CASE WHEN ship_qty IS NULL OR weight_per_sheet IS NULL THEN 0
+               ELSE ship_qty * weight_per_sheet END
+             ), 0) AS ship_weight
+           FROM (
+             SELECT
+               SUM(COALESCE(rr.claim_sheet_qty, 0)) AS claim_qty,
+               MAX(rr.actual_ship_qty) AS ship_qty,
+               MAX(rr.price_per_sheet) AS price_per_sheet,
+               MAX(rr.weight_per_sheet) AS weight_per_sheet
+             FROM reject_records rr
+             ${whereSql}
+             GROUP BY COALESCE(NULLIF(TRIM(rr.pdr_no), ''), CONCAT('#', rr.id))
+           ) orders`,
+          params,
+        ),
+        q(
+          `SELECT p.id, p.name, COUNT(*) AS count,
+                  COALESCE(SUM(rr.claim_sheet_qty), 0) AS claim_sheet_qty,
+                  COALESCE(SUM(
+                    CASE
+                      WHEN rr.claim_sheet_qty IS NULL OR rr.price_per_sheet IS NULL THEN 0
+                      ELSE rr.claim_sheet_qty * rr.price_per_sheet
+                    END
+                  ), 0) AS reject_amount
            FROM reject_records rr
            INNER JOIN problems p ON p.id = rr.problem_id
            ${whereSql}
            GROUP BY p.id, p.name
-           ORDER BY count DESC
+           ORDER BY claim_sheet_qty DESC, count DESC
            LIMIT 5`,
           params,
         ),
-        pool.query(
+        q(
           `SELECT c.id, c.name, COUNT(*) AS count,
+                  COALESCE(SUM(rr.claim_sheet_qty), 0) AS claim_sheet_qty,
                   COALESCE(SUM(
                     CASE
                       WHEN rr.claim_sheet_qty IS NULL OR rr.price_per_sheet IS NULL THEN 0
@@ -375,7 +505,7 @@ export function createDashboardService(pool) {
            LIMIT 5`,
           params,
         ),
-        pool.query(
+        q(
           `SELECT
              d.id,
              d.name,
@@ -402,7 +532,20 @@ export function createDashboardService(pool) {
            ORDER BY d.name ASC`,
           deptMasterParams,
         ),
-        pool.query(
+        q(
+          `SELECT department_id, COALESCE(SUM(ship_qty), 0) AS actual_ship_qty
+           FROM (
+             SELECT rr.department_id,
+                    MAX(rr.actual_ship_qty) AS ship_qty
+             FROM reject_records rr
+             ${whereSql}
+             GROUP BY rr.department_id,
+                      COALESCE(NULLIF(TRIM(rr.pdr_no), ''), CONCAT('#', rr.id))
+           ) orders
+           GROUP BY department_id`,
+          params,
+        ),
+        q(
           `SELECT
              p.id,
              p.name,
@@ -422,7 +565,7 @@ export function createDashboardService(pool) {
            ORDER BY p.name ASC`,
           joinParams,
         ),
-        pool.query(
+        q(
           `SELECT m.id, m.name, COUNT(*) AS count
            FROM reject_records rr
            INNER JOIN machines m ON m.id = rr.machine_id
@@ -431,7 +574,7 @@ export function createDashboardService(pool) {
            ORDER BY count DESC`,
           params,
         ),
-        pool.query(
+        q(
           `SELECT
              ranked.machine_id,
              ranked.machine_name,
@@ -459,12 +602,94 @@ export function createDashboardService(pool) {
            ORDER BY ranked.machine_name ASC, ranked.count DESC`,
           params,
         ),
+        q(
+          `SELECT
+             ranked.department_id,
+             ranked.department_name,
+             ranked.problem_id,
+             ranked.problem_name,
+             ranked.count,
+             ranked.claim_sheet_qty,
+             ranked.reject_amount
+           FROM (
+             SELECT
+               d.id AS department_id,
+               d.name AS department_name,
+               p.id AS problem_id,
+               p.name AS problem_name,
+               COUNT(*) AS count,
+               COALESCE(SUM(rr.claim_sheet_qty), 0) AS claim_sheet_qty,
+               COALESCE(SUM(
+                 CASE
+                   WHEN rr.claim_sheet_qty IS NULL OR rr.price_per_sheet IS NULL THEN 0
+                   ELSE rr.claim_sheet_qty * rr.price_per_sheet
+                 END
+               ), 0) AS reject_amount,
+               ROW_NUMBER() OVER (
+                 PARTITION BY d.id
+                 ORDER BY COALESCE(SUM(rr.claim_sheet_qty), 0) DESC, COUNT(*) DESC, p.name ASC
+               ) AS rn
+             FROM reject_records rr
+             INNER JOIN departments d ON d.id = rr.department_id
+             INNER JOIN problems p ON p.id = rr.problem_id
+             ${whereSql}
+             GROUP BY d.id, d.name, p.id, p.name
+           ) ranked
+           WHERE ranked.rn <= 2
+           ORDER BY ranked.department_name ASC, ranked.claim_sheet_qty DESC`,
+          params,
+        ),
+        q(
+          `SELECT
+             ranked.problem_id,
+             ranked.problem_name,
+             ranked.department_id,
+             ranked.department_name,
+             ranked.count,
+             ranked.claim_sheet_qty,
+             ranked.reject_amount
+           FROM (
+             SELECT
+               p.id AS problem_id,
+               p.name AS problem_name,
+               d.id AS department_id,
+               d.name AS department_name,
+               COUNT(*) AS count,
+               COALESCE(SUM(rr.claim_sheet_qty), 0) AS claim_sheet_qty,
+               COALESCE(SUM(
+                 CASE
+                   WHEN rr.claim_sheet_qty IS NULL OR rr.price_per_sheet IS NULL THEN 0
+                   ELSE rr.claim_sheet_qty * rr.price_per_sheet
+                 END
+               ), 0) AS reject_amount,
+               ROW_NUMBER() OVER (
+                 PARTITION BY p.id
+                 ORDER BY COALESCE(SUM(rr.claim_sheet_qty), 0) DESC, COUNT(*) DESC, d.name ASC
+               ) AS rn
+             FROM reject_records rr
+             INNER JOIN problems p ON p.id = rr.problem_id
+             INNER JOIN departments d ON d.id = rr.department_id
+             ${whereSql}
+             GROUP BY p.id, p.name, d.id, d.name
+           ) ranked
+           WHERE ranked.rn <= 2
+           ORDER BY ranked.problem_name ASC, ranked.claim_sheet_qty DESC`,
+          params,
+        ),
+        previous
+          ? q(
+              `SELECT COUNT(*) AS total_count,
+                      COALESCE(SUM(rr.claim_sheet_qty), 0) AS claim_sheet_qty
+               FROM reject_records rr ${prevFilter.whereSql}`,
+              prevFilter.params,
+            )
+          : Promise.resolve([[{ total_count: null, claim_sheet_qty: null }]]),
       ]);
 
-      const totalRejectWeight = Number(kpi.total_reject_weight || 0);
-      const totalShipWeight = Number(kpi.total_ship_weight || 0);
-      const totalRejectAmount = Number(kpi.total_reject_amount || 0);
-      const totalShipAmount = Number(kpi.total_ship_amount || 0);
+      const totalRejectWeight = Number(shipRow?.reject_weight ?? kpi.total_reject_weight ?? 0);
+      const totalShipWeight = Number(shipRow?.ship_weight ?? kpi.total_ship_weight ?? 0);
+      const totalRejectAmount = Number(shipRow?.reject_amount ?? kpi.total_reject_amount ?? 0);
+      const totalShipAmount = Number(shipRow?.ship_amount ?? kpi.total_ship_amount ?? 0);
       const weightRejectPct =
         totalShipWeight > 0 ? (totalRejectWeight / totalShipWeight) * 100 : 0;
       const valueRejectPct =
@@ -499,7 +724,42 @@ export function createDashboardService(pool) {
           ? machinesWithTopProblems.find((item) => item.id === machineIds[0])?.topProblems || []
           : [];
 
-      return {
+      const problemsByDepartment = new Map();
+      for (const row of departmentProblemRows) {
+        const list = problemsByDepartment.get(row.department_id) || [];
+        list.push({
+          id: row.problem_id,
+          name: row.problem_name,
+          count: Number(row.count || 0),
+          claim_sheet_qty: Number(row.claim_sheet_qty || 0),
+          reject_amount: Number(row.reject_amount || 0),
+        });
+        problemsByDepartment.set(row.department_id, list);
+      }
+
+      const departmentsByProblem = new Map();
+      for (const row of problemDepartmentRows) {
+        const list = departmentsByProblem.get(row.problem_id) || [];
+        list.push({
+          id: row.department_id,
+          name: row.department_name,
+          count: Number(row.count || 0),
+          claim_sheet_qty: Number(row.claim_sheet_qty || 0),
+          reject_amount: Number(row.reject_amount || 0),
+        });
+        departmentsByProblem.set(row.problem_id, list);
+      }
+      const prevCount = prevRow?.total_count == null ? null : Number(prevRow.total_count);
+      const currentSheets = Number(shipRow?.claim_sheet_qty ?? kpi.total_claim_sheet_qty ?? 0);
+      const focusDeptName =
+        [...topDepartments]
+          .filter((row) => Number(row.count) > 0)
+          .sort(
+            (a, b) =>
+              Number(b.claim_sheet_qty || 0) - Number(a.claim_sheet_qty || 0) ||
+              Number(b.count || 0) - Number(a.count || 0),
+          )[0]?.name || null;
+      const result = {
         filters: {
           period: range.period,
           from: range.from,
@@ -512,8 +772,9 @@ export function createDashboardService(pool) {
         },
         kpi: {
           total_count: Number(kpi.total_count || 0),
-          total_claim_sheet_qty: Number(kpi.total_claim_sheet_qty || 0),
-          total_actual_ship_qty: Number(kpi.total_actual_ship_qty || 0),
+          total_claim_sheet_qty: Number(shipRow?.claim_sheet_qty ?? kpi.total_claim_sheet_qty ?? 0),
+          total_actual_ship_qty: Number(shipRow?.actual_ship_qty ?? kpi.total_actual_ship_qty ?? 0),
+          ship_qty_note: "ยอดส่งนับไม่ซ้ำต่อใบสั่งของใบที่เคลม · ไม่ใช่ยอดทั้งโรงงาน",
           total_reject_amount: totalRejectAmount,
           total_claim_amount: totalRejectAmount,
           total_ship_amount: totalShipAmount,
@@ -525,16 +786,46 @@ export function createDashboardService(pool) {
           company_count: Number(kpi.company_count || 0),
           problem_count: Number(kpi.problem_count || 0),
         },
-        topProblems: topProblems.map((r) => ({ ...r, count: Number(r.count) })),
+        headline: {
+          kind: "reject",
+          period: range.period,
+          period_label: PERIOD_LABELS[range.period] || "ช่วงที่เลือก",
+          from: range.from,
+          to: range.to,
+          count: Number(kpi.total_count || 0),
+          previous_count: prevCount,
+          previous_from: previous?.from || null,
+          previous_to: previous?.to || null,
+          status:
+            prevRow?.claim_sheet_qty == null
+              ? null
+              : pulseVerdict(currentSheets, Number(prevRow.claim_sheet_qty || 0)),
+          claim_sheet_qty: currentSheets,
+          previous_claim_sheet_qty:
+            prevRow?.claim_sheet_qty == null ? null : Number(prevRow.claim_sheet_qty || 0),
+          reject_amount: totalRejectAmount,
+          focus_department: focusDeptName,
+          focus_problem: topProblems[0] ? topProblems[0].name : null,
+          focus_problems: topProblems.slice(0, 3).map((item) => item.name),
+        },
+        topProblems: topProblems.map((row) => ({
+          ...row,
+          count: Number(row.count),
+          claim_sheet_qty: Number(row.claim_sheet_qty || 0),
+          reject_amount: Number(row.reject_amount || 0),
+          topDepartments: departmentsByProblem.get(row.id) || [],
+        })),
         topCompanies: topCompanies.map((r) => ({
           ...r,
           count: Number(r.count),
+          claim_sheet_qty: Number(r.claim_sheet_qty || 0),
           reject_amount: Number(r.reject_amount),
           claim_amount: Number(r.reject_amount),
         })),
         topDepartments: topDepartments.map((r) => {
           const claimSheetQty = Number(r.claim_sheet_qty || 0);
-          const actualShipQty = Number(r.actual_ship_qty || 0);
+          const uniqueShip = deptShipRows.find((row) => row.department_id === r.id);
+          const actualShipQty = Number(uniqueShip?.actual_ship_qty ?? r.actual_ship_qty ?? 0);
           const rejectWeight = Number(r.reject_weight || 0);
           const rejectAmount = Number(r.reject_amount || 0);
           const rejectPct = actualShipQty > 0 ? (claimSheetQty / actualShipQty) * 100 : 0;
@@ -547,6 +838,7 @@ export function createDashboardService(pool) {
             reject_weight: rejectWeight,
             reject_amount: rejectAmount,
             reject_pct: Number(rejectPct.toFixed(4)),
+            topProblems: problemsByDepartment.get(r.id) || [],
           };
         }),
         allProblems: (() => {
@@ -564,6 +856,7 @@ export function createDashboardService(pool) {
               reject_amount: Number(r.reject_amount || 0),
               reject_pct: Number(((claimSheetQty / totalSheets) * 100).toFixed(4)),
               count_pct: Number(((count / totalCount) * 100).toFixed(4)),
+              topDepartments: departmentsByProblem.get(r.id) || [],
             };
           });
         })(),
@@ -571,26 +864,40 @@ export function createDashboardService(pool) {
         machinesWithTopProblems,
         machineTopProblems: machineTopProblems.map((r) => ({ ...r, count: Number(r.count) })),
       };
+      return dashboardPayloadCache.set(cacheKey, result);
     },
 
     /** Trend chart payload — fetched separately so summary can paint first. */
     async getRejectTrend(query = {}) {
+      const cacheKey = `reject-trend:${JSON.stringify(query || {})}`;
+      const cached = dashboardPayloadCache.get(cacheKey);
+      if (cached != null) return cached;
+
       const range = await resolveEffectiveRange(query);
       const filterIds = resolveFilterIds(query);
       const requestedGrain = String(query.trend_grain || "").toLowerCase();
       const trendGrain = ["day", "week", "month"].includes(requestedGrain)
         ? requestedGrain
         : resolveTrendGrain(range);
-      const payload = await buildRejectTrendPayload(range, filterIds, trendGrain);
-      return {
+      const requestedStack = String(query.trend_stack || "machine").toLowerCase();
+      const trendStack = requestedStack === "department" ? "department" : "machine";
+      const payload = await buildRejectTrendPayload(
+        range,
+        filterIds,
+        trendGrain,
+        trendStack,
+      );
+      const result = {
         filters: {
           period: range.period,
           from: range.from,
           to: range.to,
           trend_grain: trendGrain,
+          trend_stack: trendStack,
         },
         ...payload,
       };
+      return dashboardPayloadCache.set(cacheKey, result);
     },
 
     /** Filter dropdown options — cached briefly; independent of the active period filter. */
@@ -913,6 +1220,249 @@ export function createDashboardService(pool) {
       return fetchDayDetail(query);
     },
 
+    /**
+     * Comparison matrix for executives / improvement owners:
+     * one row per department|problem|company|machine, columns = time buckets,
+     * verdict on the latest bucket (ดีขึ้น / ทรงตัว / ต้องปรับปรุง).
+     */
+    async getSummaryTable(query = {}) {
+      const dimensionKey = String(query.dimension || "department").toLowerCase();
+      const dimension = REJECT_SUMMARY_DIMENSIONS[dimensionKey];
+      if (!dimension) {
+        const err = new Error(
+          "dimension ต้องเป็น department, problem, company หรือ machine",
+        );
+        err.status = 400;
+        throw err;
+      }
+
+      const range = await resolveEffectiveRange(query);
+      const grain = comparisonGrain(query, range);
+      const bucketConfig = REJECT_SUMMARY_BUCKETS[grain] || REJECT_SUMMARY_BUCKETS.month;
+      const requestedCount = Number(query.periods);
+      const periodsCount = bucketConfig.options.includes(requestedCount)
+        ? requestedCount
+        : bucketConfig.default;
+
+      const filterIds = resolveFilterIds(query);
+      const baseFilter = buildWhere({ ...range, ...filterIds });
+      const anchor = await resolveRejectDataAnchor(pool, baseFilter, range);
+      const periods = buildComparisonPeriods(
+        { ...range, to: anchor },
+        grain,
+        periodsCount - 1,
+      );
+      if (!periods.length) {
+        const err = new Error("ไม่สามารถคำนวณช่วงเวลาเปรียบเทียบได้");
+        err.status = 400;
+        throw err;
+      }
+
+      const combinedRange = {
+        from: periods[0].from,
+        to: periods[periods.length - 1].to,
+      };
+      const { whereSql, params } = buildWhere({ ...combinedRange, ...filterIds });
+      const bucketExpr = trendBucketSql(grain);
+
+      const [rows] = await pool.query(
+        `SELECT
+           ${bucketExpr} AS period_start,
+           ${dimension.alias}.id AS entity_id,
+           ${dimension.alias}.name AS entity_name,
+           bp.id AS problem_id,
+           bp.name AS problem_name,
+           COUNT(*) AS count,
+           COALESCE(SUM(rr.claim_sheet_qty), 0) AS claim_sheet_qty,
+           COALESCE(SUM(${REJECT_AMOUNT_SQL}), 0) AS reject_amount
+         FROM reject_records rr
+         INNER JOIN ${dimension.table} ${dimension.alias}
+           ON ${dimension.alias}.id = rr.${dimension.column}
+         LEFT JOIN problems bp ON bp.id = rr.problem_id
+         ${whereSql}
+         GROUP BY period_start, entity_id, entity_name, bp.id, bp.name
+         ORDER BY period_start ASC`,
+        params,
+      );
+
+      const periodKeyByStart = new Map(periods.map((item) => [item.from, item.key]));
+      const emptyValues = () =>
+        Object.fromEntries(
+          periods.map((item) => [item.key, { count: 0, claim_sheet_qty: 0, reject_amount: 0 }]),
+        );
+
+      const entities = new Map();
+      const periodTotals = emptyValues();
+      let grandTotal = 0;
+
+      for (const row of rows) {
+        const periodKey = periodKeyByStart.get(normalizeDate(row.period_start));
+        if (!periodKey) continue;
+        const count = Number(row.count || 0);
+        const claimSheetQty = Number(row.claim_sheet_qty || 0);
+        const rejectAmount = Number(row.reject_amount || 0);
+
+        if (!entities.has(row.entity_id)) {
+          entities.set(row.entity_id, {
+            id: row.entity_id,
+            name: row.entity_name,
+            values: emptyValues(),
+            problems: new Map(),
+          });
+        }
+        const entity = entities.get(row.entity_id);
+        entity.values[periodKey].count += count;
+        entity.values[periodKey].claim_sheet_qty += claimSheetQty;
+        entity.values[periodKey].reject_amount += rejectAmount;
+
+        if (dimensionKey !== "problem") {
+          const problemId = row.problem_id || 0;
+          if (!entity.problems.has(problemId)) {
+            entity.problems.set(problemId, {
+              id: problemId,
+              name: row.problem_name || "ไม่ระบุปัญหา",
+              values: emptyValues(),
+            });
+          }
+          const problem = entity.problems.get(problemId);
+          problem.values[periodKey].count += count;
+          problem.values[periodKey].claim_sheet_qty += claimSheetQty;
+          problem.values[periodKey].reject_amount += rejectAmount;
+        }
+
+        periodTotals[periodKey].count += count;
+        periodTotals[periodKey].claim_sheet_qty += claimSheetQty;
+        periodTotals[periodKey].reject_amount += rejectAmount;
+        grandTotal += count;
+      }
+
+      const pair = likeForLikePair(anchor, grain);
+      const likeMap = new Map();
+      if (pair) {
+        const { whereSql: pairWhere, params: pairParams } = buildWhere({
+          from: pair.baseline.from,
+          to: pair.latest.to,
+          ...filterIds,
+        });
+        const [pairRows] = await pool.query(
+          `SELECT ${dimension.alias}.id AS id,
+                  SUM(rr.reject_received_date BETWEEN ? AND ?) AS latest,
+                  SUM(rr.reject_received_date BETWEEN ? AND ?) AS baseline,
+                  COALESCE(SUM(CASE WHEN rr.reject_received_date BETWEEN ? AND ? THEN rr.claim_sheet_qty END), 0) AS latest_sheets,
+                  COALESCE(SUM(CASE WHEN rr.reject_received_date BETWEEN ? AND ? THEN rr.claim_sheet_qty END), 0) AS baseline_sheets
+           FROM reject_records rr
+           INNER JOIN ${dimension.table} ${dimension.alias}
+             ON ${dimension.alias}.id = rr.${dimension.column}
+           ${pairWhere}
+           GROUP BY ${dimension.alias}.id`,
+          [
+            pair.latest.from,
+            pair.latest.to,
+            pair.baseline.from,
+            pair.baseline.to,
+            pair.latest.from,
+            pair.latest.to,
+            pair.baseline.from,
+            pair.baseline.to,
+            ...pairParams,
+          ],
+        );
+        for (const row of pairRows) likeMap.set(row.id, row);
+      }
+
+      const toRow = (item, periodTotalsRef) => {
+        const values = periods.map((period) => {
+          const cell = item.values[period.key];
+          const periodTotal = periodTotalsRef[period.key].count;
+          return {
+            period_key: period.key,
+            count: cell.count,
+            claim_sheet_qty: cell.claim_sheet_qty || 0,
+            reject_amount: cell.reject_amount,
+            share_pct:
+              periodTotal > 0
+                ? Number(((cell.count / periodTotal) * 100).toFixed(2))
+                : 0,
+          };
+        });
+        const totalCount = values.reduce((sum, value) => sum + value.count, 0);
+        const totalAmount = values.reduce(
+          (sum, value) => sum + value.reject_amount,
+          0,
+        );
+        const like = likeMap.get(item.id);
+        const latest = like ? Number(like.latest_sheets || 0) : values[values.length - 1]?.claim_sheet_qty || 0;
+        const history = values.slice(0, -1);
+        const baseline = like
+          ? Number(like.baseline_sheets || 0)
+          : history.length
+            ? history.reduce((sum, value) => sum + (value.claim_sheet_qty || 0), 0) / history.length
+            : latest;
+
+        return {
+          id: item.id,
+          name: item.name,
+          values,
+          total_count: totalCount,
+          total_reject_amount: totalAmount,
+          avg_count: Number(baseline.toFixed(2)),
+          latest_count: latest,
+          delta: Number((latest - baseline).toFixed(2)),
+          status: rejectVerdict(latest, baseline),
+        };
+      };
+
+      const resultRows = [...entities.values()]
+        .map((entity) => {
+          const row = toRow(entity, periodTotals);
+          const children =
+            dimensionKey === "problem"
+              ? []
+              : [...entity.problems.values()]
+                  .map((problem) => toRow(problem, entity.values))
+                  .sort(
+                    (a, b) =>
+                      b.total_count - a.total_count ||
+                      a.name.localeCompare(b.name, "th"),
+                  );
+          return {
+            ...row,
+            key: `${dimensionKey}_${entity.id}`,
+            top_problems: children.slice(0, 3).map((child) => child.name),
+            children: children.map((child) => ({
+              ...child,
+              key: `${dimensionKey}_${entity.id}_problem_${child.id}`,
+            })),
+          };
+        })
+        .sort(
+          (a, b) =>
+            b.total_count - a.total_count || a.name.localeCompare(b.name, "th"),
+        );
+
+      const totals = toRow(
+        { id: 0, name: "รวมทั้งหมด", values: periodTotals },
+        periodTotals,
+      );
+
+      return {
+        dimension: dimensionKey,
+        dimension_label: dimension.label,
+        grain,
+        periods_count: periodsCount,
+        periods_options: bucketConfig.options,
+        filters: {
+          period: range.period,
+          from: combinedRange.from,
+          to: combinedRange.to,
+          anchor,
+        },
+        periods,
+        rows: resultRows,
+        totals: { ...totals, key: "totals", grand_total: grandTotal },
+      };
+    },
+
     async getKpiDetail(query = {}) {
       const type = String(query.type || "").toLowerCase();
       const allowed = new Set(["rejects", "amount", "companies", "problems"]);
@@ -950,71 +1500,39 @@ export function createDashboardService(pool) {
           type === "amount"
             ? `COALESCE(SUM(${moneyExpr}), 0) DESC, c.name ASC`
             : `COUNT(*) DESC, c.name ASC`;
-        const [rows] = await pool.query(
-          `SELECT
-             c.id,
-             c.name,
-             COUNT(*) AS count,
-             COALESCE(SUM(rr.claim_sheet_qty), 0) AS claim_sheet_qty,
-             COALESCE(SUM(${weightExpr}), 0) AS reject_weight,
-             COALESCE(SUM(${moneyExpr}), 0) AS reject_amount
-           FROM reject_records rr
-           INNER JOIN companies c ON c.id = rr.company_id
-           ${whereSql}
-           GROUP BY c.id, c.name
-           ORDER BY ${orderBy}`,
+        const page = await listRejectGroupedKpi(
+          pool,
+          `INNER JOIN companies c ON c.id = rr.company_id`,
+          "c.id, c.name",
+          orderBy,
+          whereSql,
           params,
+          moneyExpr,
+          weightExpr,
+          paging,
         );
-
-        const mapped = rows.map((r) => ({
-          id: r.id,
-          name: r.name,
-          count: Number(r.count || 0),
-          claim_sheet_qty: Number(r.claim_sheet_qty || 0),
-          reject_weight: Number(r.reject_weight || 0),
-          reject_amount: Number(r.reject_amount || 0),
-        }));
         return {
           type,
           filters: { period: range.period, from: range.from, to: range.to },
-          rows: mapped,
-          total: mapped.length,
-          page: 1,
-          pageSize: mapped.length || paging.pageSize,
+          ...page,
         };
       }
 
-      const [rows] = await pool.query(
-        `SELECT
-           p.id,
-           p.name,
-           COUNT(*) AS count,
-           COALESCE(SUM(rr.claim_sheet_qty), 0) AS claim_sheet_qty,
-           COALESCE(SUM(${weightExpr}), 0) AS reject_weight,
-           COALESCE(SUM(${moneyExpr}), 0) AS reject_amount
-         FROM reject_records rr
-         INNER JOIN problems p ON p.id = rr.problem_id
-         ${whereSql}
-         GROUP BY p.id, p.name
-         ORDER BY count DESC, p.name ASC`,
+      const page = await listRejectGroupedKpi(
+        pool,
+        `INNER JOIN problems p ON p.id = rr.problem_id`,
+        "p.id, p.name",
+        "COUNT(*) DESC, p.name ASC",
+        whereSql,
         params,
+        moneyExpr,
+        weightExpr,
+        paging,
       );
-
-      const mapped = rows.map((r) => ({
-        id: r.id,
-        name: r.name,
-        count: Number(r.count || 0),
-        claim_sheet_qty: Number(r.claim_sheet_qty || 0),
-        reject_weight: Number(r.reject_weight || 0),
-        reject_amount: Number(r.reject_amount || 0),
-      }));
       return {
         type,
         filters: { period: range.period, from: range.from, to: range.to },
-        rows: mapped,
-        total: mapped.length,
-        page: 1,
-        pageSize: mapped.length || paging.pageSize,
+        ...page,
       };
     },
 
@@ -1098,6 +1616,68 @@ function parsePaging(query = {}) {
   const pageSize = Math.min(Math.max(Number(query.pageSize) || 10, 1), 50);
   const page = Math.max(Number(query.page) || 1, 1);
   return { page, pageSize };
+}
+
+async function listRejectGroupedKpi(
+  pool,
+  joinSql,
+  groupBySql,
+  orderBySql,
+  whereSql,
+  params,
+  moneyExpr,
+  weightExpr,
+  { page = 1, pageSize = 10 } = {},
+) {
+  const size = Math.min(Math.max(Number(pageSize) || 10, 1), 50);
+  const current = Math.max(Number(page) || 1, 1);
+  const offset = (current - 1) * size;
+  const groupCols = groupBySql.split(",").map((part) => part.trim());
+  const idExpr = groupCols[0];
+  const nameExpr = groupCols[1];
+
+  const [[[countRow]], [rows]] = await Promise.all([
+    pool.query(
+      `SELECT COUNT(*) AS total FROM (
+         SELECT ${idExpr}
+         FROM reject_records rr
+         ${joinSql}
+         ${whereSql}
+         GROUP BY ${groupBySql}
+       ) grouped`,
+      params,
+    ),
+    pool.query(
+      `SELECT
+         ${idExpr} AS id,
+         ${nameExpr} AS name,
+         COUNT(*) AS count,
+         COALESCE(SUM(rr.claim_sheet_qty), 0) AS claim_sheet_qty,
+         COALESCE(SUM(${weightExpr}), 0) AS reject_weight,
+         COALESCE(SUM(${moneyExpr}), 0) AS reject_amount
+       FROM reject_records rr
+       ${joinSql}
+       ${whereSql}
+       GROUP BY ${groupBySql}
+       ORDER BY ${orderBySql}
+       LIMIT ? OFFSET ?`,
+      [...params, size, offset],
+    ),
+  ]);
+
+  return {
+    rows: rows.map((r) => ({
+      id: r.id,
+      name: r.name,
+      count: Number(r.count || 0),
+      claim_sheet_qty: Number(r.claim_sheet_qty || 0),
+      reject_weight: Number(r.reject_weight || 0),
+      reject_amount: Number(r.reject_amount || 0),
+    })),
+    total: Number(countRow?.total || 0),
+    page: current,
+    pageSize: size,
+  };
 }
 
 async function listRejectKpiRows(pool, whereSql, params, moneyExpr, weightExpr, { page = 1, pageSize = 10 } = {}) {
@@ -1200,30 +1780,28 @@ function pushNamedCount(map, date, name, count) {
   map.get(date).push({ name, count: Number(count) });
 }
 
-function formatTrendLabel(date, grain) {
-  if (!date) return "";
-  if (grain === "month") {
-    const [y, m] = date.split("-");
-    return `${y}-${m}`;
-  }
-  if (grain === "week") {
-    // date = Sunday of that week
-    return date;
-  }
-  return date;
+function formatTrendLabel(date) {
+  return formatDisplayDate(date);
 }
 
-function buildStackedTrend({ totals, byMachine, byDepartment, byProblem, grain = "day" }) {
+function buildStackedTrend({
+  totals,
+  byMachine,
+  byDepartment,
+  byProblem,
+  grain = "day",
+  stackBy = "machine",
+}) {
   const machineMap = new Map();
   const departmentMap = new Map();
   const problemMap = new Map();
   const stackTotals = new Map();
+  const stackSource = stackBy === "department" ? byDepartment : byMachine;
 
   for (const row of byMachine) {
     const date = normalizeDate(row.date);
     if (!date) continue;
     pushNamedCount(machineMap, date, row.name, row.count);
-    stackTotals.set(row.name, (stackTotals.get(row.name) || 0) + Number(row.count));
   }
   for (const row of byDepartment) {
     const date = normalizeDate(row.date);
@@ -1235,6 +1813,11 @@ function buildStackedTrend({ totals, byMachine, byDepartment, byProblem, grain =
     if (!date) continue;
     pushNamedCount(problemMap, date, row.name, row.count);
   }
+  for (const row of stackSource) {
+    const date = normalizeDate(row.date);
+    if (!date) continue;
+    stackTotals.set(row.name, (stackTotals.get(row.name) || 0) + Number(row.count));
+  }
 
   const trendStackKeys = [...stackTotals.entries()]
     .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], "th"))
@@ -1243,19 +1826,21 @@ function buildStackedTrend({ totals, byMachine, byDepartment, byProblem, grain =
   const trendRows = totals.map((row) => {
     const date = normalizeDate(row.date);
     const machines = machineMap.get(date) || [];
+    const departments = departmentMap.get(date) || [];
+    const stackItems = stackBy === "department" ? departments : machines;
     const item = {
       date,
       label: formatTrendLabel(date, grain),
       count: Number(row.count),
       machines,
-      departments: departmentMap.get(date) || [],
+      departments,
       problems: problemMap.get(date) || [],
     };
     for (const key of trendStackKeys) {
       item[key] = 0;
     }
-    for (const machine of machines) {
-      item[machine.name] = Number(machine.count);
+    for (const entry of stackItems) {
+      item[entry.name] = Number(entry.count);
     }
     return item;
   });

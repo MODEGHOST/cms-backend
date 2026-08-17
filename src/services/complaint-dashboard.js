@@ -3,13 +3,24 @@ import {
   bucketSql,
   buildComparisonPeriods,
   comparisonGrain,
+  headlineCompareRange,
+  likeForLikePair,
+  PERIOD_LABELS,
+  pulseVerdict,
   normalizeDate,
   parseIdList,
   parseStringList,
   resolveDateRange,
   resolveTrendGrain,
   shortPeriodLabel,
+  formatDisplayDate,
 } from "./dashboard-period.js";
+import { config } from "../core/config.js";
+import { createConcurrencyGate } from "../utils/concurrency-gate.js";
+import { createTtlCache } from "../utils/ttl-cache.js";
+
+/** Short TTL — identical query params return the same payload (no SQL rewrite). */
+const dashboardPayloadCache = createTtlCache({ ttlMs: 60_000, maxEntries: 64 });
 
 /** Bucket absorbing series outside the top-N of a stacked trend. */
 const OTHER_SERIES_LABEL = "อื่นๆ";
@@ -23,16 +34,6 @@ export const WORKFLOW_LABELS = {
   qa_confirm: "QA ยืนยันผล",
   completed: "ปิดเคสแล้ว",
 };
-
-/** Workflow steps that mean the complaint is still open. */
-const OPEN_STATUSES = [
-  "cs_draft",
-  "pending_qa",
-  "qa_review",
-  "pending_department",
-  "department_action",
-  "qa_confirm",
-];
 
 /** How many periods the comparison table may show, per grain. */
 const SUMMARY_BUCKETS = {
@@ -117,6 +118,7 @@ export function createComplaintDashboardService(pool) {
     shifts = [],
     grades = [],
     statuses = [],
+    includeDrafts = false,
   }) {
     const clauses = ["cr.received_date IS NOT NULL", "cr.received_date BETWEEN ? AND ?"];
     const params = [from, to];
@@ -135,6 +137,9 @@ export function createComplaintDashboardService(pool) {
     addIn("shift", shifts);
     addIn("grade", grades);
     addIn("workflow_status", statuses);
+    if (!statuses.length && !includeDrafts) {
+      clauses.push("cr.workflow_status <> 'cs_draft'");
+    }
 
     return { clauses, params };
   }
@@ -145,9 +150,12 @@ export function createComplaintDashboardService(pool) {
   }
 
   /** Top-N of one dimension with count + NG quantity. */
-  async function topBy(dimensionKey, whereSql, params, limit) {
+  async function topBy(dimensionKey, whereSql, params, limit, orderBy = "count", offset = 0) {
     const dimension = DIMENSIONS[dimensionKey];
     const nameEn = dimension.hasNameEn ? `, ${dimension.alias}.name_en AS name_en` : "";
+    const limitSql = limit
+      ? `LIMIT ${Number(limit)} OFFSET ${Math.max(0, Number(offset) || 0)}`
+      : "";
     const [rows] = await pool.query(
       `SELECT
          ${dimension.alias}.id,
@@ -160,8 +168,8 @@ export function createComplaintDashboardService(pool) {
          ON ${dimension.alias}.id = cr.${dimension.column}
        ${whereSql}
        GROUP BY ${dimension.alias}.id, ${dimension.alias}.name
-       ORDER BY count DESC, ${dimension.alias}.name ASC
-       ${limit ? `LIMIT ${Number(limit)}` : ""}`,
+       ORDER BY ${orderBy === "ng_qty" ? "ng_qty DESC, count DESC" : "count DESC"}, ${dimension.alias}.name ASC
+       ${limitSql}`,
       params,
     );
     return rows.map((row) => ({
@@ -249,7 +257,7 @@ export function createComplaintDashboardService(pool) {
       return {
         date,
         label: shortPeriodLabel(date, trendGrain),
-        full_label: date,
+        full_label: formatDisplayDate(date),
         count: num(row.count),
         ng_qty: num(row.ng_qty),
         machines: machineByDate.get(date) || [],
@@ -276,20 +284,39 @@ export function createComplaintDashboardService(pool) {
   return {
     /** KPI + rank charts only — no trend stacks / filter option lists. */
     async getSummary(query = {}) {
+      const gate = createConcurrencyGate(config.dashboardSqlBatchSize);
+      const q = (sql, params) => gate(() => pool.query(sql, params));
+      const cacheKey = `complaint-summary:${JSON.stringify(query || {})}`;
+      const cached = dashboardPayloadCache.get(cacheKey);
+      if (cached != null) return cached;
+
       const range = await resolveEffectiveRange(query);
       const filters = resolveFilters(query);
       const { whereSql, params } = buildWhere({ ...range, ...filters });
+      const { whereSql: statusWhereSql, params: statusParams } = buildWhere({
+        ...range,
+        ...filters,
+        includeDrafts: true,
+      });
+      const previous = headlineCompareRange(range);
+      const prevFilter = previous
+        ? buildWhere({ ...previous, ...filters })
+        : { whereSql: "", params: [] };
 
       const [
         [[kpi]],
+        [[demandRow]],
         topProblems,
+        focusProblems,
         topCompanies,
         departments,
+        focusDepartments,
         [grades],
         [statusRows],
         [departmentProblemRows],
+        [[prevRow]],
       ] = await Promise.all([
-        pool.query(
+        q(
           `SELECT
              COUNT(*) AS total_count,
              COUNT(DISTINCT cr.company_id) AS company_count,
@@ -299,15 +326,35 @@ export function createComplaintDashboardService(pool) {
              COALESCE(SUM(${DEMAND_QTY}), 0) AS total_demand_qty,
              SUM(cr.workflow_status = 'completed') AS completed_count,
              SUM(cr.completed_date IS NOT NULL) AS closed_count,
-             AVG(CASE WHEN cr.document_accepted = 'P' THEN cr.lead_time_days END) AS avg_lead_time_days
+             AVG(
+               CASE
+                 WHEN cr.document_accepted = 'P'
+                  AND cr.doc_forward_date IS NOT NULL
+                  AND cr.doc_reply_date IS NOT NULL
+                  AND cr.doc_reply_date >= cr.doc_forward_date
+                 THEN DATEDIFF(cr.doc_reply_date, cr.doc_forward_date)
+               END
+             ) AS avg_lead_time_days
            FROM complaint_records cr
            ${whereSql}`,
           params,
         ),
+        q(
+          `SELECT COALESCE(SUM(demand_qty), 0) AS unique_demand_qty
+           FROM (
+             SELECT MAX(COALESCE(cr.demand_qty, 0)) AS demand_qty
+             FROM complaint_records cr
+             ${whereSql}
+             GROUP BY COALESCE(NULLIF(TRIM(cr.pdr_no), ''), CONCAT('#', cr.id))
+           ) orders`,
+          params,
+        ),
         topBy("problem", whereSql, params, 5),
+        topBy("problem", whereSql, params, 3, "ng_qty"),
         topBy("company", whereSql, params, 5),
         topBy("department", whereSql, params, null),
-        pool.query(
+        topBy("department", whereSql, params, 3, "ng_qty"),
+        q(
           `SELECT COALESCE(NULLIF(TRIM(cr.grade), ''), 'ไม่ระบุ') AS name, COUNT(*) AS count
            FROM complaint_records cr
            ${whereSql}
@@ -315,14 +362,14 @@ export function createComplaintDashboardService(pool) {
            ORDER BY count DESC`,
           params,
         ),
-        pool.query(
+        q(
           `SELECT cr.workflow_status AS status, COUNT(*) AS count
            FROM complaint_records cr
-           ${whereSql}
+           ${statusWhereSql}
            GROUP BY cr.workflow_status`,
-          params,
+          statusParams,
         ),
-        pool.query(
+        q(
           `SELECT ranked.department_id, ranked.department_name,
                   ranked.problem_id, ranked.problem_name, ranked.problem_name_en, ranked.count
            FROM (
@@ -346,11 +393,19 @@ export function createComplaintDashboardService(pool) {
            ORDER BY ranked.department_name ASC, ranked.count DESC`,
           params,
         ),
+        previous
+          ? q(
+              `SELECT COUNT(*) AS total_count,
+                      COALESCE(SUM(${NG_QTY}), 0) AS total_ng_qty
+               FROM complaint_records cr ${prevFilter.whereSql}`,
+              prevFilter.params,
+            )
+          : Promise.resolve([[{ total_count: null, total_ng_qty: null }]]),
       ]);
 
       const totalCount = num(kpi.total_count);
       const totalNgQty = num(kpi.total_ng_qty);
-      const totalDemandQty = num(kpi.total_demand_qty);
+      const totalDemandQty = num(demandRow?.unique_demand_qty ?? kpi.total_demand_qty);
       const completedCount = num(kpi.completed_count);
 
       const departmentMap = new Map(
@@ -368,12 +423,9 @@ export function createComplaintDashboardService(pool) {
       }
 
       const statusByKey = new Map(statusRows.map((row) => [row.status, num(row.count)]));
-      const openCount = OPEN_STATUSES.reduce(
-        (sum, status) => sum + (statusByKey.get(status) || 0),
-        0,
-      );
+      const openCount = Math.max(0, totalCount - completedCount);
 
-      return {
+      const result = {
         filters: {
           period: range.period,
           from: range.from,
@@ -395,6 +447,7 @@ export function createComplaintDashboardService(pool) {
           total_ng_qty: totalNgQty,
           total_demand_qty: totalDemandQty,
           ng_pct: totalDemandQty > 0 ? Number(((totalNgQty / totalDemandQty) * 100).toFixed(4)) : 0,
+          ng_pct_note: "ของเสีย ÷ ยอดสั่งของใบ Complaint (นับใบสั่งไม่ซ้ำ · ไม่ใช่ยอดทั้งโรงงาน)",
           completed_count: completedCount,
           open_count: openCount,
           completed_pct:
@@ -403,10 +456,32 @@ export function createComplaintDashboardService(pool) {
             kpi.avg_lead_time_days == null ? null : Number(Number(kpi.avg_lead_time_days).toFixed(1)),
         },
         topProblems,
+        focusProblems,
+        focusDepartments,
         topCompanies,
         topDepartments: departments.slice(0, 5),
         departments,
         departmentsWithTopProblems: [...departmentMap.values()],
+        headline: {
+          kind: "complaint",
+          period: range.period,
+          period_label: PERIOD_LABELS[range.period] || "ช่วงที่เลือก",
+          from: range.from,
+          to: range.to,
+          count: totalCount,
+          previous_count: prevRow?.total_count == null ? null : num(prevRow.total_count),
+          ng_qty: totalNgQty,
+          previous_ng_qty: prevRow?.total_ng_qty == null ? null : num(prevRow.total_ng_qty),
+          previous_from: previous?.from || null,
+          previous_to: previous?.to || null,
+          status:
+            prevRow?.total_ng_qty == null
+              ? null
+              : pulseVerdict(totalNgQty, num(prevRow.total_ng_qty)),
+          focus_department: focusDepartments[0]?.name || null,
+          focus_problem: focusProblems[0]?.name || null,
+          focus_problems: focusProblems.slice(0, 3).map((item) => item.name),
+        },
         grades: grades.map((row) => ({ name: row.name, count: num(row.count) })),
         statuses: Object.keys(WORKFLOW_LABELS).map((status) => ({
           status,
@@ -414,10 +489,15 @@ export function createComplaintDashboardService(pool) {
           count: statusByKey.get(status) || 0,
         })),
       };
+      return dashboardPayloadCache.set(cacheKey, result);
     },
 
     /** Trend chart payload — fetched separately so grain changes do not reload KPI charts. */
     async getTrend(query = {}) {
+      const cacheKey = `complaint-trend:${JSON.stringify(query || {})}`;
+      const cached = dashboardPayloadCache.get(cacheKey);
+      if (cached != null) return cached;
+
       const range = await resolveEffectiveRange(query);
       const filters = resolveFilters(query);
       const requestedGrain = String(query.trend_grain || "").toLowerCase();
@@ -425,7 +505,7 @@ export function createComplaintDashboardService(pool) {
         ? requestedGrain
         : resolveTrendGrain(range);
       const payload = await buildTrendPayload(range, filters, trendGrain);
-      return {
+      const result = {
         filters: {
           period: range.period,
           from: range.from,
@@ -434,6 +514,7 @@ export function createComplaintDashboardService(pool) {
         },
         ...payload,
       };
+      return dashboardPayloadCache.set(cacheKey, result);
     },
 
     /** Filter dropdown options — cached briefly; independent of the active period filter. */
@@ -586,6 +667,28 @@ export function createComplaintDashboardService(pool) {
         grandTotal += count;
       }
 
+      const pair = likeForLikePair(anchor, grain);
+      const likeMap = new Map();
+      if (pair) {
+        const { whereSql: pairWhere, params: pairParams } = buildWhere({
+          from: pair.baseline.from,
+          to: pair.latest.to,
+          ...filters,
+        });
+        const [pairRows] = await pool.query(
+          `SELECT ${dimension.alias}.id AS id,
+                  SUM(cr.received_date BETWEEN ? AND ?) AS latest,
+                  SUM(cr.received_date BETWEEN ? AND ?) AS baseline
+           FROM complaint_records cr
+           INNER JOIN ${dimension.table} ${dimension.alias}
+             ON ${dimension.alias}.id = cr.${dimension.column}
+           ${pairWhere}
+           GROUP BY ${dimension.alias}.id`,
+          [pair.latest.from, pair.latest.to, pair.baseline.from, pair.baseline.to, ...pairParams],
+        );
+        for (const row of pairRows) likeMap.set(row.id, row);
+      }
+
       const toRow = (item, periodTotalsRef) => {
         const values = periods.map((period) => {
           const cell = item.values[period.key];
@@ -599,11 +702,14 @@ export function createComplaintDashboardService(pool) {
         });
         const totalCount = values.reduce((sum, value) => sum + value.count, 0);
         const totalNgQty = values.reduce((sum, value) => sum + value.ng_qty, 0);
-        const latest = values[values.length - 1]?.count || 0;
+        const like = likeMap.get(item.id);
+        const latest = like ? num(like.latest) : values[values.length - 1]?.count || 0;
         const history = values.slice(0, -1);
-        const baseline = history.length
-          ? history.reduce((sum, value) => sum + value.count, 0) / history.length
-          : latest;
+        const baseline = like
+          ? num(like.baseline)
+          : history.length
+            ? history.reduce((sum, value) => sum + value.count, 0) / history.length
+            : latest;
 
         return {
           id: item.id,
@@ -623,7 +729,7 @@ export function createComplaintDashboardService(pool) {
         .map((entity) => {
           const row = toRow(entity, periodTotals);
           const children = [...entity.problems.values()]
-            .map((problem) => toRow(problem, periodTotals))
+            .map((problem) => toRow(problem, entity.values))
             .sort((a, b) => b.total_count - a.total_count || a.name.localeCompare(b.name, "th"));
           return {
             ...row,
@@ -686,14 +792,29 @@ export function createComplaintDashboardService(pool) {
         throw badRequest("type ต้องเป็น complaints, companies, problems หรือ departments");
       }
 
-      const rows = await topBy(dimensionKey, whereSql, params, null);
+      const dimension = DIMENSIONS[dimensionKey];
+      const offset = (paging.page - 1) * paging.pageSize;
+      const [[[countRow]], rows] = await Promise.all([
+        pool.query(
+          `SELECT COUNT(*) AS total FROM (
+             SELECT ${dimension.alias}.id
+             FROM complaint_records cr
+             INNER JOIN ${dimension.table} ${dimension.alias}
+               ON ${dimension.alias}.id = cr.${dimension.column}
+             ${whereSql}
+             GROUP BY ${dimension.alias}.id
+           ) grouped`,
+          params,
+        ),
+        topBy(dimensionKey, whereSql, params, paging.pageSize, "count", offset),
+      ]);
       return {
         type,
         filters: { period: range.period, from: range.from, to: range.to },
         rows,
-        total: rows.length,
-        page: 1,
-        pageSize: rows.length || paging.pageSize,
+        total: Number(countRow?.total || 0),
+        page: paging.page,
+        pageSize: paging.pageSize,
       };
     },
 

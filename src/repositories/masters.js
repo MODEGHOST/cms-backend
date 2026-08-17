@@ -48,7 +48,7 @@ export function createMasterRepository(pool) {
   return {
     async listSimple(key, params = {}) {
       const cfg = getConfig(key);
-      const { page, pageSize, offset } = parsePagination(params);
+      const { page, pageSize, offset } = parsePagination(params, { maxPageSize: 5000 });
       const where = [];
       const values = [];
 
@@ -130,7 +130,7 @@ export function createMasterRepository(pool) {
     },
 
     async listCustomerAliases(params = {}) {
-      const { page, pageSize, offset } = parsePagination(params);
+      const { page, pageSize, offset } = parsePagination(params, { maxPageSize: 5000 });
       const where = [];
       const values = [];
 
