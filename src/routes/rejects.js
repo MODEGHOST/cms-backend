@@ -8,6 +8,7 @@ import { logger } from "../core/logger.js";
 import { paginatedJson, parsePagination, toDateOnly } from "../validators/common.js";
 import { createFromErpService } from "../services/from-erp.js";
 import { createComplaintRepository } from "../repositories/complaints.js";
+import { createUserRepository } from "../repositories/users.js";
 import { buildRejectMemoPdf } from "../services/reject-memo-pdf.js";
 import { buildRejectTagPdf } from "../services/reject-tag-pdf.js";
 import {
@@ -22,6 +23,7 @@ let formOptionsCachedAt = 0;
 /** Reject record routes — list / lookup + QC update. */
 export function registerRejectRoutes(app, { pool, wrap, requireAuth, telegram }) {
   const rejects = createRejectRepository(pool);
+  const users = createUserRepository(pool);
   const activityLogs = createActivityLogRepository(pool);
   const rejectService = createRejectService(pool, rejects, activityLogs);
   const fromErp = createFromErpService({

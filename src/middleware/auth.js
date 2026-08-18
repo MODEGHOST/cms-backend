@@ -1,17 +1,17 @@
 import jwt from "jsonwebtoken";
 import { config } from "../core/config.js";
+import { readTokenFromRequest } from "../core/session-cookie.js";
 import { createUserRepository } from "../repositories/users.js";
 
 /**
  * JWT proves identity; CMS roles/permissions come from DB (short TTL in users repo).
+ * Accepts Portal cookie `lfb_token` (claim `sub` or `id`) as well as the legacy `token` cookie.
  */
 export function createAuth(pool) {
   const users = createUserRepository(pool);
 
   return async function requireAuth(req, res, next) {
-    const header = req.headers.authorization || "";
-    const tokenFromHeader = header.startsWith("Bearer ") ? header.slice(7) : null;
-    const token = tokenFromHeader || req.cookies?.token;
+    const token = readTokenFromRequest(req);
 
     if (!token) {
       return res.status(401).json({ message: "Unauthorized" });
@@ -19,7 +19,11 @@ export function createAuth(pool) {
 
     try {
       const claims = jwt.verify(token, config.jwtSecret);
-      const user = await users.findById(claims.sub);
+      const userId = claims.sub ?? claims.id;
+      if (userId == null || userId === "") {
+        return res.status(401).json({ message: "Unauthorized" });
+      }
+      const user = await users.findById(userId);
       if (
         !user ||
         !user.is_active ||

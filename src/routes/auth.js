@@ -106,6 +106,7 @@ export function registerAuthRoutes(app, { pool, wrap, requireAuth, telegram }) {
       const token = jwt.sign(
         {
           sub: user.id,
+          id: user.id,
           username: user.username,
         },
         config.jwtSecret,

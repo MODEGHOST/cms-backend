@@ -25,9 +25,13 @@ function collectCorsOrigins(env) {
     const origin = originFromUrl(value);
     if (origin) origins.add(origin);
   };
-  add(env.FRONTEND_URL || "http://localhost:5173");
+  add(env.FRONTEND_URL || "http://localhost:5174");
   add("http://localhost:5173");
   add("http://127.0.0.1:5173");
+  add("http://localhost:5174");
+  add("http://127.0.0.1:5174");
+  add("http://localhost:5180");
+  add("http://127.0.0.1:5180");
   for (const part of String(env.CORS_ORIGINS || "").split(",")) {
     add(part);
   }
@@ -65,7 +69,7 @@ export function loadConfig(env = process.env) {
     port: Number(env.PORT || 4000),
     /** IIS virtual path (e.g. /lfb_cms/backend). Empty = routes at /api/... */
     basePath: normalizeBasePath(env.BASE_PATH),
-    frontendUrl: env.FRONTEND_URL || "http://localhost:5173",
+    frontendUrl: env.FRONTEND_URL || "http://localhost:5174",
     corsOrigins: collectCorsOrigins(env),
     jwtSecret,
     authTokenTtl: env.AUTH_TOKEN_TTL || "8h",
