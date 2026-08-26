@@ -39,6 +39,7 @@ async function boot() {
 
   const server = app.listen(config.port, () => {
     logger.info(`CMS API listening on port ${config.port}`);
+    logger.info(`JWT fp=${config.jwtSecretFp} (must match Portal + IPMS)`);
     if (config.basePath) {
       logger.info(`IIS BASE_PATH ${config.basePath} (stripped before routes)`);
     }

@@ -1,3 +1,15 @@
+import { createHash } from "node:crypto";
+
+const PLACEHOLDER_JWT = new Set([
+  "lfb-center-change-this-in-production",
+  "development-secret",
+  "change-this-to-at-least-32-characters",
+]);
+
+function jwtSecretFingerprint(secret) {
+  return createHash("sha256").update(String(secret || "")).digest("hex").slice(0, 12);
+}
+
 function normalizeBasePath(value) {
   const raw = String(value || "").trim();
   if (!raw || raw === "/") return "";
@@ -50,6 +62,9 @@ export function loadConfig(env = process.env) {
   if (production && jwtSecret.length < 32) {
     throw new Error("JWT_SECRET must contain at least 32 characters in production");
   }
+  if (production && PLACEHOLDER_JWT.has(jwtSecret)) {
+    throw new Error("JWT_SECRET must be a unique production value shared by Portal, IPMS, and CMS");
+  }
 
   const smtpUser = env.SMTP_USER || "";
   const smtpPass = env.SMTP_PASS || "";
@@ -72,6 +87,7 @@ export function loadConfig(env = process.env) {
     frontendUrl: env.FRONTEND_URL || "http://localhost:5174",
     corsOrigins: collectCorsOrigins(env),
     jwtSecret,
+    jwtSecretFp: jwtSecretFingerprint(jwtSecret),
     authTokenTtl: env.AUTH_TOKEN_TTL || "8h",
     trustProxy: env.TRUST_PROXY === "1" ? 1 : false,
     seedDemoData: env.SEED_DEMO_DATA == null ? !production : env.SEED_DEMO_DATA === "1",
