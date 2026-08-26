@@ -1,5 +1,6 @@
 import { createRejectRepository } from "../repositories/rejects.js";
 import { createActivityLogRepository } from "../repositories/activity-logs.js";
+import { createUserRepository } from "../repositories/users.js";
 import { createRejectService } from "../services/rejects.js";
 import { createTelegramNotifier } from "../services/telegram-notifier.js";
 import { canUpdateRejects } from "../core/authz.js";
@@ -22,6 +23,7 @@ let formOptionsCachedAt = 0;
 /** Reject record routes — list / lookup + QC update. */
 export function registerRejectRoutes(app, { pool, wrap, requireAuth, telegram }) {
   const rejects = createRejectRepository(pool);
+  const users = createUserRepository(pool);
   const activityLogs = createActivityLogRepository(pool);
   const rejectService = createRejectService(pool, rejects, activityLogs);
   const fromErp = createFromErpService({
