@@ -9,6 +9,7 @@
   "scripts": {
     "dev": "node src/server.js",
     "start": "node src/server.js",
+    "start:pm2": "pm2 start ecosystem.config.cjs --env production",
     "db:init": "node scripts/init-db.js",
     "db:migrate-center-user": "node scripts/migrate-center-user-lfb.js",
     "db:migrate-cms-rbac": "node scripts/migrate-cms-rbac.js",
