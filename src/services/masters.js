@@ -1,5 +1,6 @@
 import { httpError } from "../core/http-error.js";
 import { createMasterRepository } from "../repositories/masters.js";
+import { enrichProblemRow } from "../utils/problem-image.js";
 
 const SIMPLE_KEYS = new Set(["companies", "departments", "machines", "problems", "shifts"]);
 
@@ -12,7 +13,11 @@ export function createMasterService(pool) {
         return repo.listCustomerAliases(query);
       }
       if (!SIMPLE_KEYS.has(key)) throw httpError(404, "Master not found");
-      return repo.listSimple(key, query);
+      const result = await repo.listSimple(key, query);
+      if (key === "problems") {
+        return { ...result, data: (result.data || []).map(enrichProblemRow) };
+      }
+      return result;
     },
 
     async create(key, body) {
@@ -35,7 +40,8 @@ export function createMasterService(pool) {
         if (key === "companies" && body?.aliases != null) {
           await repo.ensureAliases(id, body.aliases);
         }
-        return repo.findById(key, id);
+        const row = await repo.findById(key, id);
+        return key === "problems" ? enrichProblemRow(row) : row;
       } catch (err) {
         if (err?.code === "ER_DUP_ENTRY") throw httpError(409, "Name already exists");
         throw err;
@@ -50,7 +56,8 @@ export function createMasterService(pool) {
         try {
           const ok = await repo.updateCustomerAlias(numericId, body);
           if (!ok) throw httpError(404, "Not found");
-          return repo.findById(key, numericId);
+          const row = await repo.findById(key, numericId);
+          return key === "problems" ? enrichProblemRow(row) : row;
         } catch (err) {
           if (err?.status) throw err;
           if (err?.code === "ER_DUP_ENTRY") throw httpError(409, "Name already exists");
@@ -64,7 +71,8 @@ export function createMasterService(pool) {
         if (key === "companies" && body?.aliases != null) {
           await repo.ensureAliases(numericId, body.aliases);
         }
-        return repo.findById(key, numericId);
+        const row = await repo.findById(key, numericId);
+        return key === "problems" ? enrichProblemRow(row) : row;
       } catch (err) {
         if (err?.status) throw err;
         if (err?.code === "ER_DUP_ENTRY") throw httpError(409, "Name already exists");

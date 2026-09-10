@@ -17,6 +17,7 @@ import {
 import { config } from "../core/config.js";
 import { createConcurrencyGate } from "../utils/concurrency-gate.js";
 import { createTtlCache } from "../utils/ttl-cache.js";
+import { enrichProblemRow, mapFocusProblems } from "../utils/problem-image.js";
 
 /** Short TTL — identical query params return the same payload (no SQL rewrite). */
 const dashboardPayloadCache = createTtlCache({ ttlMs: 60_000, maxEntries: 64 });
@@ -290,7 +291,8 @@ export function createDashboardService(pool) {
     const bucketExpr = trendBucketSql(trendGrain);
     const stackMode = trendStack === "department" ? "department" : "machine";
 
-    const [[trend], [trendByMachine], [trendByDepartment], [trendByProblem]] = await Promise.all([
+    const [[trend], [trendByMachine], [trendByDepartment], [trendByProblem], [postClaimTrend]] =
+      await Promise.all([
       pool.query(
         `SELECT ${bucketExpr} AS date, COUNT(*) AS count
          FROM reject_records rr
@@ -335,6 +337,17 @@ export function createDashboardService(pool) {
          ORDER BY date ASC, count DESC`,
         params,
       ),
+      pool.query(
+        `SELECT
+           ${bucketExpr} AS date,
+           COALESCE(SUM(rr.destroy_bl_amount), 0) AS destroy_bl_amount,
+           COALESCE(SUM(rr.return_amount), 0) AS return_amount
+         FROM reject_records rr
+         ${whereSql}
+         GROUP BY ${bucketExpr}
+         ORDER BY date ASC`,
+        params,
+      ),
     ]);
 
     const { trendRows, trendStackKeys } = buildStackedTrend({
@@ -351,6 +364,12 @@ export function createDashboardService(pool) {
       trendStackKeys,
       trendGrain,
       trendStack: stackMode,
+      postClaimTrend: postClaimTrend.map((row) => ({
+        date: normalizeDate(row.date),
+        label: formatTrendLabel(normalizeDate(row.date), trendGrain),
+        destroy_bl_amount: Number(row.destroy_bl_amount || 0),
+        return_amount: Number(row.return_amount || 0),
+      })),
     };
   }
 
@@ -433,6 +452,10 @@ export function createDashboardService(pool) {
                END
              ), 0) AS total_ship_weight,
              COALESCE(SUM(rr.claim_weight_kg), 0) AS total_claim_weight_kg,
+             COALESCE(SUM(rr.destroy_bl_qty), 0) AS total_destroy_bl_qty,
+             COALESCE(SUM(rr.destroy_bl_amount), 0) AS total_destroy_bl_amount,
+             COALESCE(SUM(rr.return_to_customer_qty), 0) AS total_return_to_customer_qty,
+             COALESCE(SUM(rr.return_amount), 0) AS total_return_amount,
              COUNT(DISTINCT rr.company_id) AS company_count,
              COUNT(DISTINCT rr.problem_id) AS problem_count
            FROM reject_records rr
@@ -472,7 +495,7 @@ export function createDashboardService(pool) {
           params,
         ),
         q(
-          `SELECT p.id, p.name, COUNT(*) AS count,
+          `SELECT p.id, p.name, p.image_file, COUNT(*) AS count,
                   COALESCE(SUM(rr.claim_sheet_qty), 0) AS claim_sheet_qty,
                   COALESCE(SUM(
                     CASE
@@ -483,7 +506,7 @@ export function createDashboardService(pool) {
            FROM reject_records rr
            INNER JOIN problems p ON p.id = rr.problem_id
            ${whereSql}
-           GROUP BY p.id, p.name
+           GROUP BY p.id, p.name, p.image_file
            ORDER BY claim_sheet_qty DESC, count DESC
            LIMIT 5`,
           params,
@@ -783,6 +806,10 @@ export function createDashboardService(pool) {
           weight_reject_pct: Number(weightRejectPct.toFixed(4)),
           value_reject_pct: Number(valueRejectPct.toFixed(4)),
           total_claim_weight_kg: Number(kpi.total_claim_weight_kg || 0),
+          total_destroy_bl_qty: Number(kpi.total_destroy_bl_qty || 0),
+          total_destroy_bl_amount: Number(kpi.total_destroy_bl_amount || 0),
+          total_return_to_customer_qty: Number(kpi.total_return_to_customer_qty || 0),
+          total_return_amount: Number(kpi.total_return_amount || 0),
           company_count: Number(kpi.company_count || 0),
           problem_count: Number(kpi.problem_count || 0),
         },
@@ -806,15 +833,17 @@ export function createDashboardService(pool) {
           reject_amount: totalRejectAmount,
           focus_department: focusDeptName,
           focus_problem: topProblems[0] ? topProblems[0].name : null,
-          focus_problems: topProblems.slice(0, 3).map((item) => item.name),
+          focus_problems: mapFocusProblems(topProblems),
         },
-        topProblems: topProblems.map((row) => ({
-          ...row,
-          count: Number(row.count),
-          claim_sheet_qty: Number(row.claim_sheet_qty || 0),
-          reject_amount: Number(row.reject_amount || 0),
-          topDepartments: departmentsByProblem.get(row.id) || [],
-        })),
+        topProblems: topProblems.map((row) =>
+          enrichProblemRow({
+            ...row,
+            count: Number(row.count),
+            claim_sheet_qty: Number(row.claim_sheet_qty || 0),
+            reject_amount: Number(row.reject_amount || 0),
+            topDepartments: departmentsByProblem.get(row.id) || [],
+          }),
+        ),
         topCompanies: topCompanies.map((r) => ({
           ...r,
           count: Number(r.count),
@@ -1698,7 +1727,11 @@ async function listRejectKpiRows(pool, whereSql, params, moneyExpr, weightExpr, 
          rr.shift,
          COALESCE(rr.claim_sheet_qty, 0) AS claim_sheet_qty,
          COALESCE(${weightExpr}, 0) AS reject_weight,
-         COALESCE(${moneyExpr}, 0) AS reject_amount
+         COALESCE(${moneyExpr}, 0) AS reject_amount,
+         COALESCE(rr.destroy_bl_qty, 0) AS destroy_bl_qty,
+         COALESCE(rr.destroy_bl_amount, 0) AS destroy_bl_amount,
+         COALESCE(rr.return_to_customer_qty, 0) AS return_to_customer_qty,
+         COALESCE(rr.return_amount, 0) AS return_amount
        FROM reject_records rr
        LEFT JOIN companies c ON c.id = rr.company_id
        LEFT JOIN departments d ON d.id = rr.department_id
@@ -1723,6 +1756,10 @@ async function listRejectKpiRows(pool, whereSql, params, moneyExpr, weightExpr, 
       claim_sheet_qty: Number(r.claim_sheet_qty || 0),
       reject_weight: Number(r.reject_weight || 0),
       reject_amount: Number(r.reject_amount || 0),
+      destroy_bl_qty: Number(r.destroy_bl_qty || 0),
+      destroy_bl_amount: Number(r.destroy_bl_amount || 0),
+      return_to_customer_qty: Number(r.return_to_customer_qty || 0),
+      return_amount: Number(r.return_amount || 0),
     })),
     total: Number(countRow?.total || 0),
     page: current,

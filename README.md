@@ -30,26 +30,24 @@ cms-backend/
 
 Server บริษัทใช้ **Node.js 16.20.x** (`engines`: `>=16.20.0`) — ชุดเดียวกับ IPMS (`prdproject`).
 
-IIS ใช้โครงเดียวกับ IPMS (**PM2 + IIS reverse proxy**):
+Deploy บริษัท (**PM2** — frontend เรียก API ที่ port 4001 ตรง ไม่ต้อง IIS proxy backend):
 
-| | Path |
+| | Path / Port |
 |---|---|
-| Frontend | `/lfb_cms/frontend` |
-| Backend | `/lfb_cms/backend` (`web.config` proxy → PM2, `BASE_PATH=/lfb_cms/backend`) |
+| Frontend (IIS static) | `/lfb_cms/frontend` |
+| Backend (PM2) | port **4001**, `BASE_PATH=/lfb_cms/backend` |
 
-บน server ใส่ค่าใน `.env.production` ตาม `.env.production.example` (`PORT=4001`, `TRUST_PROXY=1`, `SEED_DEMO_DATA=0`)  
-IPMS ใช้ port **4000** — CMS ใช้ **4001** ไม่ชนกัน
-
-อัปโหลด: ทั้งโฟลเดอร์นี้ไป `lfb_cms/backend` — **อย่าลาก `node_modules` / `.env`**  
-บนเครื่อง server (Node 16) รัน `npm install` แล้ว:
+บน server ใส่ค่าใน `.env.production` (`PORT=4001`, `TRUST_PROXY=1`, …)  
+IPMS ใช้ **4000** — CMS ใช้ **4001**
 
 ```powershell
 cd C:\inetpub\wwwroot\lfb_cms\backend
+npm install
 pm2 start ecosystem.config.cjs --env production
 pm2 save
 ```
 
-IIS: Convert `lfb_cms/backend` เป็น Application (proxy ไม่ต้องใช้ HttpPlatformHandler)
+`web.config` ใน backend เป็น **ทางเลือก** (IIS proxy) — โหมด default ใช้แค่ PM2 + frontend build ใหม่
 
 ## เริ่มต้น (XAMPP MySQL)
 

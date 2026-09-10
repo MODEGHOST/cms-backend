@@ -125,6 +125,7 @@ export function loadConfig(env = process.env) {
       enabled: env.ERP_API_ENABLED === "1",
       baseUrl: String(env.ERP_API_URL || "").trim().replace(/\/$/, ""),
       timeoutMs: Math.max(1000, Number(env.ERP_API_TIMEOUT_MS || 5000)),
+      devFixture: env.NODE_ENV === "development" && env.ERP_DEV_FIXTURE === "1",
     }),
   });
 }

@@ -19,7 +19,15 @@ const MASTER_CONFIG = {
   problems: {
     table: "problems",
     searchable: ["name", "name_en"],
-    fields: ["id", "name", "name_en", "is_active", "created_at", "updated_at"],
+    fields: [
+      "id",
+      "name",
+      "name_en",
+      "image_file",
+      "is_active",
+      "created_at",
+      "updated_at",
+    ],
   },
   shifts: {
     table: "shifts",

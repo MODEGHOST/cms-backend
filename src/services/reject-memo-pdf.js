@@ -170,7 +170,7 @@ export async function buildRejectMemoPdf(record, overrides = {}) {
     "ลูกค้า:",
     text(record.company_name, text(record.customer_alias_name, "")),
   );
-  writeRow("ORDER:", formatQty(record.order_qty), { underlineW: 120 });
+  writeRow("ORDER:", text(record.order_no, ""), { underlineW: 120 });
   writeRow("เลขที่IV:", text(record.invoice_no, ""), { underlineW: 160 });
   writeRow("LOT NO:", o.lot_no, { underlineW: 170 });
   writeRow("SOSA:", text(record.sale_order_no, ""), { underlineW: 160 });

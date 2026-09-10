@@ -18,6 +18,7 @@ import {
 import { config } from "../core/config.js";
 import { createConcurrencyGate } from "../utils/concurrency-gate.js";
 import { createTtlCache } from "../utils/ttl-cache.js";
+import { enrichProblemRow, mapFocusProblems } from "../utils/problem-image.js";
 
 /** Short TTL — identical query params return the same payload (no SQL rewrite). */
 const dashboardPayloadCache = createTtlCache({ ttlMs: 60_000, maxEntries: 64 });
@@ -57,6 +58,7 @@ const DIMENSIONS = {
     alias: "p",
     column: "problem_id",
     hasNameEn: true,
+    hasImageFile: true,
   },
   company: {
     label: "ลูกค้าที่ร้องเรียน",
@@ -153,13 +155,19 @@ export function createComplaintDashboardService(pool) {
   async function topBy(dimensionKey, whereSql, params, limit, orderBy = "count", offset = 0) {
     const dimension = DIMENSIONS[dimensionKey];
     const nameEn = dimension.hasNameEn ? `, ${dimension.alias}.name_en AS name_en` : "";
+    const imageFile = dimension.hasImageFile
+      ? `, ${dimension.alias}.image_file`
+      : "";
+    const groupCols = [`${dimension.alias}.id`, `${dimension.alias}.name`];
+    if (dimension.hasNameEn) groupCols.push(`${dimension.alias}.name_en`);
+    if (dimension.hasImageFile) groupCols.push(`${dimension.alias}.image_file`);
     const limitSql = limit
       ? `LIMIT ${Number(limit)} OFFSET ${Math.max(0, Number(offset) || 0)}`
       : "";
     const [rows] = await pool.query(
       `SELECT
          ${dimension.alias}.id,
-         ${dimension.alias}.name${nameEn},
+         ${dimension.alias}.name${nameEn}${imageFile},
          COUNT(*) AS count,
          COALESCE(SUM(${NG_QTY}), 0) AS ng_qty,
          COALESCE(SUM(${DEMAND_QTY}), 0) AS demand_qty
@@ -167,19 +175,22 @@ export function createComplaintDashboardService(pool) {
        INNER JOIN ${dimension.table} ${dimension.alias}
          ON ${dimension.alias}.id = cr.${dimension.column}
        ${whereSql}
-       GROUP BY ${dimension.alias}.id, ${dimension.alias}.name
+       GROUP BY ${groupCols.join(", ")}
        ORDER BY ${orderBy === "ng_qty" ? "ng_qty DESC, count DESC" : "count DESC"}, ${dimension.alias}.name ASC
        ${limitSql}`,
       params,
     );
-    return rows.map((row) => ({
-      id: row.id,
-      name: row.name,
-      name_en: row.name_en || null,
-      count: num(row.count),
-      ng_qty: num(row.ng_qty),
-      demand_qty: num(row.demand_qty),
-    }));
+    return rows.map((row) =>
+      enrichProblemRow({
+        id: row.id,
+        name: row.name,
+        name_en: row.name_en || null,
+        image_file: row.image_file || null,
+        count: num(row.count),
+        ng_qty: num(row.ng_qty),
+        demand_qty: num(row.demand_qty),
+      }),
+    );
   }
 
   async function trendBreakdown(bucketExpr, joinSql, nameExpr, whereSql, params) {
@@ -480,7 +491,7 @@ export function createComplaintDashboardService(pool) {
               : pulseVerdict(totalNgQty, num(prevRow.total_ng_qty)),
           focus_department: focusDepartments[0]?.name || null,
           focus_problem: focusProblems[0]?.name || null,
-          focus_problems: focusProblems.slice(0, 3).map((item) => item.name),
+          focus_problems: mapFocusProblems(focusProblems),
         },
         grades: grades.map((row) => ({ name: row.name, count: num(row.count) })),
         statuses: Object.keys(WORKFLOW_LABELS).map((status) => ({

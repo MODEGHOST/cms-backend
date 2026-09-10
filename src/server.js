@@ -9,6 +9,7 @@ import { ensureOrderDailyCount } from "./core/ensure-order-daily-count.js";
 import { ensureDeptTargetSettings } from "./core/ensure-dept-target-settings.js";
 import { ensureListIndexes } from "./core/ensure-list-indexes.js";
 import { ensureRecordProblems } from "./core/ensure-record-problems.js";
+import { ensureProblemImage } from "./core/ensure-problem-image.js";
 import { logger } from "./core/logger.js";
 import { seedAdminUser } from "./routes/auth.js";
 
@@ -29,6 +30,7 @@ async function boot() {
       await ensureDeptTargetSettings(conn);
       await ensureListIndexes(conn);
       await ensureRecordProblems(conn);
+      await ensureProblemImage(conn);
     } finally {
       conn.release();
     }

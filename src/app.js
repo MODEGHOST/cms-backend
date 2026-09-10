@@ -51,7 +51,12 @@ export function createApplication() {
     });
   }
 
-  app.use(helmet());
+  // Frontend (:90) and API (:4001) are different origins — allow <img>/blob loads.
+  app.use(
+    helmet({
+      crossOriginResourcePolicy: { policy: "cross-origin" },
+    }),
+  );
   app.use(
     cors({
       origin(origin, callback) {

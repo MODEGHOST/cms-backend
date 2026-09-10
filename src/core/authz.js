@@ -37,6 +37,15 @@ export function canManageMasters(user) {
   return isBuiltInAdmin(user);
 }
 
+/** Upload/update problem reference images — Admin, Dev, QA, QC. */
+export function canManageProblemImages(user) {
+  return (
+    isBuiltInAdmin(user) ||
+    hasPermission(user, "complaints.qa") ||
+    hasPermission(user, "rejects.update")
+  );
+}
+
 export function canCsWork(user) {
   return isCmsAdmin(user) || hasPermission(user, "complaints.cs");
 }

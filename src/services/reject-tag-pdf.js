@@ -62,7 +62,7 @@ function drawOneTag(doc, record, overrides, palletIndex, box) {
     o.customer_return_qty ?? record.claim_sheet_qty ?? o.small_sheet_qty,
   );
   const smallSize = text(o.small_sheet_size || record.small_sheet_size, "");
-  const orderPart = formatQty(record.order_qty);
+  const orderPart = text(record.order_no, "");
   const seqRight = text(record.shift, "");
   const weightPerSheet = Number(record.weight_per_sheet);
   const netWeight =

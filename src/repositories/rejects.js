@@ -237,6 +237,7 @@ export function createRejectRepository(pool) {
       machineId = null,
       fluteId = null,
       saleOrderNo = null,
+      orderNo = null,
       orderQty = null,
       size = null,
       cutQty = null,
@@ -261,7 +262,7 @@ export function createRejectRepository(pool) {
       const [result] = await pool.query(
         `INSERT INTO reject_records (
            pdr_no, company_id, customer_alias_id, machine_id, flute_id,
-           sale_order_no, order_qty, size,
+           sale_order_no, order_no, order_qty, size,
            cut_qty, item_code, big_sheet_qty, big_sheet_size, small_sheet_size,
            shift, vehicle_plate,
            customer_ship_date, production_date,
@@ -269,7 +270,7 @@ export function createRejectRepository(pool) {
            problem_id, department_id, remark,
            source, source_complaint_id,
            created_by, updated_by
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
         [
           pdrNo,
           companyId,
@@ -277,6 +278,7 @@ export function createRejectRepository(pool) {
           machineId,
           fluteId,
           saleOrderNo,
+          orderNo,
           orderQty,
           size,
           cutQty,

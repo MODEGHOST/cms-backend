@@ -23,6 +23,7 @@
     "db:ensure-reject-tag-erp": "node scripts/ensure-reject-tag-erp-fields.js",
     "db:ensure-reject-flute": "node scripts/ensure-reject-flute.js",
     "db:ensure-company-name-en": "node scripts/ensure-company-name-en.js",
+    "db:ensure-problem-image": "node scripts/ensure-problem-image.js",
     "db:sync-company-name-en": "node scripts/sync-company-name-en-from-complaint.js",
     "db:migrate-departments": "node scripts/migrate-departments-master.js",
     "db:import-reject": "node scripts/import-reject-excel.js",

@@ -132,6 +132,7 @@ CREATE TABLE IF NOT EXISTS problems (
   name VARCHAR(255) NOT NULL,
   -- English label from Complaint Excel "Problem" column (optional)
   name_en VARCHAR(255) NULL,
+  image_file VARCHAR(255) NULL,
   is_active TINYINT(1) NOT NULL DEFAULT 1,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -183,6 +184,7 @@ CREATE TABLE IF NOT EXISTS reject_records (
   invoice_no VARCHAR(80) NULL,
   pdr_no VARCHAR(80) NULL,
   sale_order_no VARCHAR(80) NULL,
+  order_no VARCHAR(80) NULL,
   order_qty DECIMAL(14, 2) NULL,
   size VARCHAR(255) NULL,
   -- Tag snapshot จาก ERP GET /api/pdr (ไม่เขียนกลับ ERP)

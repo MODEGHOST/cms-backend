@@ -206,7 +206,10 @@ function mapRow(rawRow, textRow) {
     invoice_no: cleanText(text["INVOICE"]),
     pdr_no: cleanText(text["PDR"]),
     sale_order_no: cleanText(text["Sale Order"]),
-    order_qty: parseNumber(text["Order"]),
+    order_no: cleanText(text["Order"]),
+    order_qty: parseNumber(
+      text["Order Qty"] ?? text["Quantity"] ?? text["จำนวน"],
+    ),
     size: cleanText(text["Size"]),
     shift: cleanText(text["กะ"]),
     job_type: cleanText(text["ลักษณะงาน"]),
@@ -348,7 +351,7 @@ async function main() {
         `INSERT INTO reject_records (
           company_id, customer_alias_id, department_id, machine_id, problem_id,
           doc_notify_date, reject_received_date, customer_ship_date, production_date, repair_date,
-          invoice_no, pdr_no, sale_order_no, order_qty, size, shift, job_type, vehicle_plate, cause, remark,
+          invoice_no, pdr_no, sale_order_no, order_no, order_qty, size, shift, job_type, vehicle_plate, cause, remark,
           actual_ship_qty, claim_sheet_qty, weight_per_sheet, claim_weight_kg, price_per_sheet, claim_amount,
           sort_claim_sup_qty, sort_weight_kg, return_to_customer_qty, return_amount, return_kg,
           destroy_bl_qty, destroy_bl_weight, destroy_bl_amount
@@ -356,7 +359,7 @@ async function main() {
         [
           companyId, aliasId, departmentId, machineId, problemId,
           row.doc_notify_date, row.reject_received_date, row.customer_ship_date, row.production_date, row.repair_date,
-          row.invoice_no, row.pdr_no, row.sale_order_no, row.order_qty, row.size, row.shift, row.job_type, row.vehicle_plate, row.cause, row.remark,
+          row.invoice_no, row.pdr_no, row.sale_order_no, row.order_no, row.order_qty, row.size, row.shift, row.job_type, row.vehicle_plate, row.cause, row.remark,
           row.actual_ship_qty, row.claim_sheet_qty, row.weight_per_sheet, row.claim_weight_kg, row.price_per_sheet, row.claim_amount,
           row.sort_claim_sup_qty, row.sort_weight_kg, row.return_to_customer_qty, row.return_amount, row.return_kg,
           row.destroy_bl_qty, row.destroy_bl_weight, row.destroy_bl_amount,

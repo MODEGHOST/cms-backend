@@ -26,6 +26,114 @@ function toInt(value) {
   return number == null ? null : Math.trunc(number);
 }
 
+function roundCalc(value, digits = 2) {
+  const factor = 10 ** digits;
+  return Math.round(Number(value) * factor) / factor;
+}
+
+/** ERP คำนวณราคา/น้ำหนักต่อแผ่นเล็กแล้ว — sync ทุกครั้งที่ดึง ERP (ไม่ใช่ setIfEmpty) */
+function syncErpCalculatedField(updates, changes, current, column, nextValue, label) {
+  const afterNum = toNumber(nextValue);
+  if (afterNum == null) return;
+  const beforeNum = toNumber(current[column]);
+  if (beforeNum != null && beforeNum === afterNum) return;
+  updates[column] = afterNum;
+  changes.push({
+    field: column,
+    label,
+    before: beforeNum != null ? String(beforeNum) : "(ว่าง)",
+    after: String(afterNum),
+  });
+}
+
+function appendClaimTotalsFromErp(updates, changes, current) {
+  const claimQty = toNumber(current.claim_sheet_qty);
+  const price = toNumber(updates.price_per_sheet ?? current.price_per_sheet);
+  const weight = toNumber(updates.weight_per_sheet ?? current.weight_per_sheet);
+
+  if (claimQty != null) {
+    if (price != null) {
+      const amount = roundCalc(claimQty * price);
+      const before = toNumber(current.claim_amount);
+      if (before !== amount) {
+        updates.claim_amount = amount;
+        changes.push({
+          field: "claim_amount",
+          label: "จำนวนเงิน",
+          before: before != null ? String(before) : "(ว่าง)",
+          after: String(amount),
+        });
+      }
+    }
+
+    if (weight != null) {
+      const kg = roundCalc(claimQty * weight);
+      const before = toNumber(current.claim_weight_kg);
+      if (before !== kg) {
+        updates.claim_weight_kg = kg;
+        changes.push({
+          field: "claim_weight_kg",
+          label: "รวมน้ำหนักเคลม (KG)/Order",
+          before: before != null ? String(before) : "(ว่าง)",
+          after: String(kg),
+        });
+      }
+    }
+  }
+
+  syncQtyDerivedField(
+    updates,
+    changes,
+    current,
+    "destroy_bl_qty",
+    "destroy_bl_amount",
+    price,
+    "จำนวนเงินทำลาย BL",
+  );
+  syncQtyDerivedField(
+    updates,
+    changes,
+    current,
+    "destroy_bl_qty",
+    "destroy_bl_weight",
+    weight,
+    "น้ำหนักทำลาย BL",
+  );
+  syncQtyDerivedField(
+    updates,
+    changes,
+    current,
+    "return_to_customer_qty",
+    "return_amount",
+    price,
+    "จำนวนเงินที่ส่งคืนลูกค้า",
+  );
+  syncQtyDerivedField(
+    updates,
+    changes,
+    current,
+    "return_to_customer_qty",
+    "return_kg",
+    weight,
+    "จำนวน KG",
+  );
+}
+
+function syncQtyDerivedField(updates, changes, current, qtyField, targetField, perUnit, label) {
+  const qty = toNumber(current[qtyField]);
+  if (qty == null || perUnit == null) return;
+  const next = roundCalc(qty * perUnit);
+  const before = toNumber(current[targetField]);
+  if (before === next) return;
+  updates[targetField] = next;
+  changes.push({
+    field: targetField,
+    label,
+    before: before != null ? String(before) : "(ว่าง)",
+    after: String(next),
+  });
+}
+
 /** ฟิลด์ใบ Tag จากแถว ERP หรือ draft — อ่านอย่างเดียว ไม่เขียนกลับ ERP */
 function pickRejectTagFields(row) {
   return {
@@ -272,7 +380,8 @@ export function createFromErpService({
         machineId,
         fluteId,
         saleOrderNo: toText(erpRow.sale_order_no),
-        orderQty: toNumber(erpRow.order_qty ?? erpRow.demand_qty),
+        orderNo: toText(erpRow.order_no),
+        orderQty: toNumber(erpRow.demand_qty),
         size,
         cutQty: tag.cutQty,
         itemCode: tag.itemCode,
@@ -359,7 +468,8 @@ export function createFromErpService({
         machineId,
         fluteId,
         saleOrderNo: toText(payload.sale_order_no),
-        orderQty: toNumber(payload.order_qty ?? payload.demand_qty),
+        orderNo: toText(payload.order_no),
+        orderQty: toNumber(payload.demand_qty ?? payload.order_qty),
         size,
         cutQty: tag.cutQty,
         itemCode: tag.itemCode,
@@ -482,11 +592,8 @@ export function createFromErpService({
       }
 
       setIfEmpty("sale_order_no", toText(erpRow.sale_order_no), "Sale Order");
-      setIfEmpty(
-        "order_qty",
-        toNumber(erpRow.order_qty ?? erpRow.demand_qty),
-        "Order Qty",
-      );
+      setIfEmpty("order_no", toText(erpRow.order_no), "Order");
+      setIfEmpty("order_qty", toNumber(erpRow.demand_qty), "Order Qty");
       setIfEmpty("size", sizeFromErp, "Size");
       setIfEmpty("shift", toText(erpRow.shift), "กะ");
       setIfEmpty("vehicle_plate", toText(erpRow.vehicle_plate), "ทะเบียนรถ");
@@ -500,16 +607,23 @@ export function createFromErpService({
         toDate(erpRow.production_date),
         "วันที่ผลิต",
       );
-      setIfEmpty(
+      syncErpCalculatedField(
+        updates,
+        changes,
+        current,
         "weight_per_sheet",
-        toNumber(erpRow.weight_per_sheet),
-        "น้ำหนัก/แผ่น",
+        erpRow.weight_per_sheet,
+        "น้ำหนัก/แผ่น (แผ่นเล็ก)",
       );
-      setIfEmpty(
+      syncErpCalculatedField(
+        updates,
+        changes,
+        current,
         "price_per_sheet",
-        toNumber(erpRow.price_per_sheet),
-        "ราคา/แผ่น",
+        erpRow.price_per_sheet,
+        "ราคา/แผ่นเล็ก",
       );
+      appendClaimTotalsFromErp(updates, changes, current);
 
       const tag = pickRejectTagFields(erpRow);
       setIfEmpty("cut_qty", tag.cutQty, "ผ่า");
