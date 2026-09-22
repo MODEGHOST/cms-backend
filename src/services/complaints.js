@@ -12,6 +12,8 @@ import {
   problemNamesOf,
 } from "../utils/problem-names.js";
 import { replaceProblemsSafe, updateRecordFields } from "../repositories/record-problems.js";
+import { lookupCustomerCare } from "./customer-care.js";
+import { calendarPartsFromDate } from "../utils/calendar-parts.js";
 
 const TEXT = "text";
 const NUMBER = "number";
@@ -43,6 +45,12 @@ export const COMPLAINT_FIELD_META = {
     cs_remark: ["หมายเหตุ CS", TEXT],
     received_date: ["วันที่รับเรื่อง", DATE],
     document_accepted: ["เอกสาร Action plan", TEXT],
+    document_scope: ["ร้องเรียนภายใน/ภายนอก", TEXT],
+    license_plate: ["ทะเบียนรถ", TEXT],
+    subject: ["เรื่องที่ complaint", TEXT],
+    company_name: ["ชื่อลูกค้า", TEXT],
+    sale_cs_staff: ["เจ้าหน้าที่ Sale/CS", TEXT],
+    grade: ["Grade", TEXT],
   },
   qa: {
     problem_name: ["ปัญหา", MASTER],
@@ -53,6 +61,22 @@ export const COMPLAINT_FIELD_META = {
     document_accepted: ["เอกสาร Action plan", TEXT],
     document_scope: ["เอกสารภายใน/ภายนอก", TEXT],
     document_no: ["เลขที่เอกสาร", TEXT],
+    license_plate: ["ทะเบียนรถ", TEXT],
+    subject: ["เรื่องที่ complaint", TEXT],
+    grade: ["Grade", TEXT],
+    quarter: ["ไตรมาส", TEXT],
+    week_no: ["week", NUMBER],
+    month_no: ["เดือน", NUMBER],
+    customer_group: ["Group", TEXT],
+    team: ["Team", TEXT],
+    channel: ["channel", TEXT],
+    agency: ["หน่วยงาน", TEXT],
+    issue_type: ["ประเภท", TEXT],
+    transport_problem: ["ปัญหา", TEXT],
+    qa_cause: ["สาเหตุ", TEXT],
+    occurrence_no: ["ครั้งที่", NUMBER],
+    sup_car: ["SUP CAR", TEXT],
+    lts_ack_date: ["LTS รับทราบ", DATE],
   },
   department: {
     cause: ["สาเหตุ", TEXT],
@@ -98,7 +122,25 @@ const STATUS_CONFIG = {
 
 const REQUIRED_ON_SUBMIT = {
   cs: ["problem_name", "received_date", "document_accepted"],
+  cs_service_transport: [
+    "document_scope",
+    "company_name",
+    "license_plate",
+    "subject",
+    "received_date",
+    "document_accepted",
+  ],
   qa: ["reported_by_department_name", "responsible_department_name", "document_accepted"],
+  qa_service_transport: [
+    "quarter",
+    "customer_group",
+    "issue_type",
+    "transport_problem",
+    "sup_car",
+    "reported_by_department_name",
+    "responsible_department_name",
+    "document_accepted",
+  ],
   department: ["cause", "correction", "prevention"],
 };
 
@@ -619,10 +661,30 @@ export function createComplaintService(complaints, activityLogs) {
           error.status = 403;
           throw error;
         }
-        await complaints.updateById(id, {
+        const acceptUpdates = {
           workflow_status: "qa_review",
           updated_by: actor.id,
-        });
+          qa_accepted_by: actor.id,
+        };
+        if (current.complaint_kind === "service_transport") {
+          const parts = calendarPartsFromDate(current.received_date);
+          if (current.week_no == null && parts.week_no != null) {
+            acceptUpdates.week_no = parts.week_no;
+          }
+          if (current.month_no == null && parts.month_no != null) {
+            acceptUpdates.month_no = parts.month_no;
+          }
+          if (current.occurrence_no == null) {
+            const prior = await complaints.countServiceTransportByCompany(
+              current.company_id,
+              id,
+            );
+            acceptUpdates.occurrence_no = prior + 1;
+          }
+          if (!current.channel) acceptUpdates.channel = "Line";
+          if (!current.agency) acceptUpdates.agency = "ลูกค้า";
+        }
+        await complaints.updateById(id, acceptUpdates);
         await activityLogs.create({
           userId: actor.id,
           username: actor.username,
@@ -638,6 +700,12 @@ export function createComplaintService(complaints, activityLogs) {
               label: "สถานะ",
               before: status,
               after: "qa_review",
+            },
+            {
+              field: "qa_accepted_by",
+              label: "ผู้บันทึก",
+              before: null,
+              after: actor.display_name || actor.username || actor.id,
             },
           ],
         });
@@ -939,6 +1007,14 @@ export function createComplaintService(complaints, activityLogs) {
           changes.push({ field: key, label, before, after });
           continue;
         }
+        // Transport: Sale/CS + grade come from customer_care when company is chosen.
+        if (
+          current.complaint_kind === "service_transport" &&
+          Object.prototype.hasOwnProperty.call(payload, "company_name") &&
+          (key === "sale_cs_staff" || key === "grade")
+        ) {
+          continue;
+        }
         if (!Object.prototype.hasOwnProperty.call(payload, key)) continue;
         const before =
           key === "document_accepted"
@@ -962,11 +1038,69 @@ export function createComplaintService(complaints, activityLogs) {
           error.status = 400;
           throw error;
         }
-        if (before === after) continue;
+        // Service/transport: document_scope = ประเภทร้องเรียน (Excel sheet) — ห้ามล้างเมื่อ Action plan = O
+        if (
+          key === "document_scope" &&
+          current.complaint_kind === "service_transport" &&
+          after == null &&
+          normalizeDocumentScope(current.document_scope)
+        ) {
+          continue;
+        }
+        if (before === after) {
+          // Still enrich Sale/CS from customer_care when company is re-sent.
+          if (
+            key === "company_name" &&
+            after &&
+            current.complaint_kind === "service_transport"
+          ) {
+            const care = await lookupCustomerCare(after);
+            if (care?.sale_cs_staff && care.sale_cs_staff !== current.sale_cs_staff) {
+              updates.sale_cs_staff = care.sale_cs_staff;
+              changes.push({
+                field: "sale_cs_staff",
+                label: "เจ้าหน้าที่ Sale/CS",
+                before: current.sale_cs_staff || null,
+                after: care.sale_cs_staff,
+              });
+            }
+            if (care?.grade && care.grade !== current.grade) {
+              updates.grade = care.grade;
+              changes.push({
+                field: "grade",
+                label: "Grade",
+                before: current.grade || null,
+                after: care.grade,
+              });
+            }
+          }
+          continue;
+        }
         changes.push({ field: key, label, before, after });
 
         if (key === "company_name") {
           updates.company_id = await complaints.resolveCompanyId(after);
+          if (current.complaint_kind === "service_transport") {
+            const care = await lookupCustomerCare(after);
+            updates.sale_cs_staff = care?.sale_cs_staff || null;
+            if (care?.grade) updates.grade = care.grade;
+            if ((care?.sale_cs_staff || null) !== (current.sale_cs_staff || null)) {
+              changes.push({
+                field: "sale_cs_staff",
+                label: "เจ้าหน้าที่ Sale/CS",
+                before: current.sale_cs_staff || null,
+                after: care?.sale_cs_staff || null,
+              });
+            }
+            if (care?.grade && care.grade !== current.grade) {
+              changes.push({
+                field: "grade",
+                label: "Grade",
+                before: current.grade || null,
+                after: care.grade,
+              });
+            }
+          }
         } else if (key === "customer_alias_name") {
           const companyId = updates.company_id ?? current.company_id;
           updates.customer_alias_id = await complaints.resolveAliasId(companyId, after);
@@ -989,7 +1123,13 @@ export function createComplaintService(complaints, activityLogs) {
 
       const isSubmit = payload.action === "submit";
       if (isSubmit) {
-        const requiredKeys = REQUIRED_ON_SUBMIT[config.group] || [];
+        const isServiceTransport = current.complaint_kind === "service_transport";
+        const requiredKeys =
+          config.group === "cs" && isServiceTransport
+            ? REQUIRED_ON_SUBMIT.cs_service_transport
+            : config.group === "qa" && isServiceTransport
+              ? REQUIRED_ON_SUBMIT.qa_service_transport
+              : REQUIRED_ON_SUBMIT[config.group] || [];
         for (const key of requiredKeys) {
           const value =
             Object.prototype.hasOwnProperty.call(updates, key)
@@ -1006,6 +1146,10 @@ export function createComplaintService(complaints, activityLogs) {
                     ? (Object.prototype.hasOwnProperty.call(updates, "responsible_department_id")
                       ? updates.responsible_department_id
                       : current.responsible_department_id || current.responsible_department_name)
+                    : key === "company_name"
+                      ? (Object.prototype.hasOwnProperty.call(updates, "company_id")
+                        ? updates.company_id
+                        : current.company_id || current.company_name)
                     : key === "document_accepted"
                       ? (updates.document_accepted ?? normalizeDocumentAccepted(current.document_accepted))
                       : (updates[key] ?? current[key]);
@@ -1014,6 +1158,26 @@ export function createComplaintService(complaints, activityLogs) {
             const error = new Error(`กรุณากรอก${label}`);
             error.status = 400;
             throw error;
+          }
+        }
+
+        // Transport QA: keep week/month in sync with received_date; never wipe auto fields.
+        if (isServiceTransport && config.group === "qa") {
+          const parts = calendarPartsFromDate(
+            updates.received_date ?? current.received_date,
+          );
+          if (parts.week_no != null) updates.week_no = parts.week_no;
+          if (parts.month_no != null) updates.month_no = parts.month_no;
+          if (
+            updates.occurrence_no == null &&
+            current.occurrence_no == null &&
+            current.company_id
+          ) {
+            const prior = await complaints.countServiceTransportByCompany(
+              current.company_id,
+              id,
+            );
+            updates.occurrence_no = prior + 1;
           }
         }
 

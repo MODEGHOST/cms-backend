@@ -122,7 +122,11 @@ export function createComplaintDashboardService(pool) {
     statuses = [],
     includeDrafts = false,
   }) {
-    const clauses = ["cr.received_date IS NOT NULL", "cr.received_date BETWEEN ? AND ?"];
+    const clauses = [
+      "cr.received_date IS NOT NULL",
+      "cr.received_date BETWEEN ? AND ?",
+      "(cr.complaint_kind = 'product' OR cr.complaint_kind IS NULL)",
+    ];
     const params = [from, to];
 
     const addIn = (column, values) => {
@@ -213,7 +217,8 @@ export function createComplaintDashboardService(pool) {
     const [[row]] = await pool.query(
       `SELECT MIN(received_date) AS min_date, MAX(received_date) AS max_date
        FROM complaint_records
-       WHERE received_date IS NOT NULL`,
+       WHERE received_date IS NOT NULL
+         AND (complaint_kind = 'product' OR complaint_kind IS NULL)`,
     );
     return {
       period: "all",

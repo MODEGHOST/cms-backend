@@ -335,6 +335,149 @@ async function main() {
       `DATE NULL AFTER document_accepted_at`,
     );
 
+    await ensureColumn(
+      conn,
+      "complaint_records",
+      "complaint_kind",
+      `ENUM('product', 'service_transport') NOT NULL DEFAULT 'product' AFTER excel_seq`,
+    );
+
+    await ensureColumn(
+      conn,
+      "complaint_records",
+      "license_plate",
+      `VARCHAR(40) NULL AFTER sale_cs_staff`,
+    );
+
+    await ensureColumn(
+      conn,
+      "complaint_records",
+      "subject",
+      `VARCHAR(500) NULL AFTER license_plate`,
+    );
+
+    // Service/transport QA Excel sheet fields
+    await ensureColumn(
+      conn,
+      "complaint_records",
+      "quarter",
+      `VARCHAR(10) NULL AFTER subject`,
+    );
+    await ensureColumn(
+      conn,
+      "complaint_records",
+      "week_no",
+      `TINYINT UNSIGNED NULL AFTER quarter`,
+    );
+    await ensureColumn(
+      conn,
+      "complaint_records",
+      "month_no",
+      `TINYINT UNSIGNED NULL AFTER week_no`,
+    );
+    await ensureColumn(
+      conn,
+      "complaint_records",
+      "customer_group",
+      `VARCHAR(40) NULL AFTER month_no`,
+    );
+    await ensureColumn(
+      conn,
+      "complaint_records",
+      "team",
+      `VARCHAR(80) NULL AFTER customer_group`,
+    );
+    await ensureColumn(
+      conn,
+      "complaint_records",
+      "channel",
+      `VARCHAR(80) NULL AFTER team`,
+    );
+    await ensureColumn(
+      conn,
+      "complaint_records",
+      "agency",
+      `VARCHAR(80) NULL AFTER channel`,
+    );
+    await ensureColumn(
+      conn,
+      "complaint_records",
+      "issue_type",
+      `VARCHAR(20) NULL AFTER agency`,
+    );
+    await ensureColumn(
+      conn,
+      "complaint_records",
+      "transport_problem",
+      `VARCHAR(500) NULL AFTER issue_type`,
+    );
+    await ensureColumn(
+      conn,
+      "complaint_records",
+      "qa_cause",
+      `TEXT NULL AFTER transport_problem`,
+    );
+    await ensureColumn(
+      conn,
+      "complaint_records",
+      "occurrence_no",
+      `INT UNSIGNED NULL AFTER qa_cause`,
+    );
+    await ensureColumn(
+      conn,
+      "complaint_records",
+      "sup_car",
+      `VARCHAR(80) NULL AFTER occurrence_no`,
+    );
+    await ensureColumn(
+      conn,
+      "complaint_records",
+      "lts_ack_date",
+      `DATE NULL AFTER sup_car`,
+    );
+    await ensureColumn(
+      conn,
+      "complaint_records",
+      "qa_accepted_by",
+      `BIGINT UNSIGNED NULL AFTER lts_ack_date`,
+    );
+
+    await conn.query(`
+      CREATE TABLE IF NOT EXISTS transport_problems (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        name VARCHAR(255) NOT NULL,
+        is_active TINYINT(1) NOT NULL DEFAULT 1,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uq_transport_problems_name (name)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    const { TRANSPORT_PROBLEM_NAMES } = await import(
+      "./data/transport-problems-master-list.js"
+    );
+    for (const name of TRANSPORT_PROBLEM_NAMES) {
+      const clean = String(name || "").trim();
+      if (!clean) continue;
+      await conn.query(
+        `INSERT INTO transport_problems (name, is_active) VALUES (?, 1)
+         ON DUPLICATE KEY UPDATE is_active = 1`,
+        [clean],
+      );
+    }
+    console.log(`Seeded transport_problems (${TRANSPORT_PROBLEM_NAMES.length} names)`);
+
+    // Index for filtering product vs service/transport menus
+    try {
+      await conn.query(
+        `CREATE INDEX idx_complaint_kind ON complaint_records (complaint_kind)`,
+      );
+      console.log("Added idx_complaint_kind");
+    } catch (err) {
+      if (err?.code !== "ER_DUP_KEYNAME") throw err;
+    }
+
     const [[flutes]] = await conn.query("SELECT COUNT(*) AS c FROM flutes");
     const [[complaints]] = await conn.query(
       "SELECT COUNT(*) AS c FROM complaint_records",

@@ -21,6 +21,7 @@ export function createComplaintRepository(pool) {
       cs_user.department AS cs_submitted_by_department,
       created_user.department AS created_by_department,
       qa_user.display_name AS qa_submitted_by_name,
+      qa_accept_user.display_name AS qa_accepted_by_name,
       dept_user.display_name AS department_submitted_by_name,
       confirm_user.display_name AS confirmed_by_name,
       CASE
@@ -41,6 +42,7 @@ export function createComplaintRepository(pool) {
     LEFT JOIN users cs_user ON cs_user.id = cr.cs_submitted_by
     LEFT JOIN users created_user ON created_user.id = cr.created_by
     LEFT JOIN users qa_user ON qa_user.id = cr.qa_submitted_by
+    LEFT JOIN users qa_accept_user ON qa_accept_user.id = cr.qa_accepted_by
     LEFT JOIN users dept_user ON dept_user.id = cr.department_submitted_by
     LEFT JOIN users confirm_user ON confirm_user.id = cr.confirmed_by
   `;
@@ -49,10 +51,16 @@ export function createComplaintRepository(pool) {
     SELECT
       cr.id,
       cr.pdr_no,
+      cr.complaint_kind,
+      cr.document_scope,
+      cr.license_plate,
+      cr.subject,
       cr.ng_qty,
       cr.received_date,
       cr.document_accepted,
       cr.workflow_status,
+      cr.sale_cs_staff,
+      cr.grade,
       c.name AS company_name,
       COALESCE(
         NULLIF((
@@ -107,16 +115,18 @@ export function createComplaintRepository(pool) {
       if (!clean) return [];
       // Prefer exact match so idx_complaint_pdr can be used; fall back to TRIM
       // for legacy rows that were stored with surrounding whitespace.
+      // Product Complaint only (exclude service/transport).
+      const kindSql = `(cr.complaint_kind = 'product' OR cr.complaint_kind IS NULL)`;
       const [exact] = await pool.query(
         `${detailSelect}
-         WHERE cr.pdr_no = ?
+         WHERE cr.pdr_no = ? AND ${kindSql}
          ORDER BY cr.received_date DESC, cr.id DESC`,
         [clean],
       );
       if (exact.length) return recordProblems.attachComplaintRows(exact);
       const [trimmed] = await pool.query(
         `${detailSelect}
-         WHERE TRIM(cr.pdr_no) = ?
+         WHERE TRIM(cr.pdr_no) = ? AND ${kindSql}
          ORDER BY cr.received_date DESC, cr.id DESC`,
         [clean],
       );
@@ -138,6 +148,7 @@ export function createComplaintRepository(pool) {
       if (keyword) {
         filters.push(
           `(cr.pdr_no LIKE ? OR c.name LIKE ? OR p.name LIKE ? OR COALESCE(responsible.name, '') LIKE ?
+            OR cr.license_plate LIKE ? OR cr.subject LIKE ?
             OR EXISTS (
               SELECT 1 FROM complaint_record_problems crp
               INNER JOIN problems px ON px.id = crp.problem_id
@@ -145,7 +156,7 @@ export function createComplaintRepository(pool) {
             ))`,
         );
         const like = `%${keyword}%`;
-        values.push(like, like, like, like, like);
+        values.push(like, like, like, like, like, like, like);
       }
       const where = `WHERE ${filters.join(" AND ")}`;
 
@@ -367,6 +378,86 @@ export function createComplaintRepository(pool) {
         ],
       );
       return result.insertId;
+    },
+
+    async createServiceTransport({
+      licensePlate = null,
+      subject = null,
+      receivedDate = null,
+      documentScope = null,
+      companyId = null,
+      customerAliasId = null,
+      grade = null,
+      saleCsStaff = null,
+      createdBy = null,
+    } = {}) {
+      const [result] = await pool.query(
+        `INSERT INTO complaint_records (
+           complaint_kind, document_scope, license_plate, subject, received_date,
+           company_id, customer_alias_id, grade, sale_cs_staff,
+           workflow_status, created_by, updated_by
+         ) VALUES ('service_transport', ?, ?, ?, ?, ?, ?, ?, ?, 'cs_draft', ?, NULL)`,
+        [
+          documentScope || null,
+          licensePlate || null,
+          subject || null,
+          receivedDate || null,
+          companyId || null,
+          customerAliasId || null,
+          grade || null,
+          saleCsStaff || null,
+          createdBy,
+        ],
+      );
+      return result.insertId;
+    },
+
+    async countByWorkflowKind(
+      kind = "service_transport",
+      documentScope = null,
+      { from = null, to = null } = {},
+    ) {
+      const filters = ["complaint_kind = ?"];
+      const params = [kind];
+      if (documentScope === "ภายใน" || documentScope === "ภายนอก") {
+        filters.push("document_scope = ?");
+        params.push(documentScope);
+      }
+      if (from && to) {
+        filters.push("received_date IS NOT NULL");
+        filters.push("received_date >= ?");
+        filters.push("received_date <= ?");
+        params.push(from, to);
+      }
+      const [rows] = await pool.query(
+        `SELECT workflow_status, COUNT(*) AS total
+           FROM complaint_records
+          WHERE ${filters.join(" AND ")}
+          GROUP BY workflow_status`,
+        params,
+      );
+      return rows.map((row) => ({
+        workflow_status: row.workflow_status,
+        total: Number(row.total || 0),
+      }));
+    },
+
+    async countServiceTransportByCompany(companyId, excludeId = null) {
+      if (!companyId) return 0;
+      const filters = [
+        "complaint_kind = 'service_transport'",
+        "company_id = ?",
+      ];
+      const params = [companyId];
+      if (excludeId) {
+        filters.push("id <> ?");
+        params.push(excludeId);
+      }
+      const [[row]] = await pool.query(
+        `SELECT COUNT(*) AS total FROM complaint_records WHERE ${filters.join(" AND ")}`,
+        params,
+      );
+      return Number(row?.total || 0);
     },
 
     async resolveProblemId(name, nameEn) {

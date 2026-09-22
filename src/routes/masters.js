@@ -26,6 +26,7 @@ export function registerMasterRoutes(app, { pool, wrap, requireAuth }) {
     "departments",
     "machines",
     "problems",
+    "transport-problems",
     "shifts",
   ];
 

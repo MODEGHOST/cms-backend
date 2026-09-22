@@ -2,7 +2,14 @@ import { httpError } from "../core/http-error.js";
 import { createMasterRepository } from "../repositories/masters.js";
 import { enrichProblemRow } from "../utils/problem-image.js";
 
-const SIMPLE_KEYS = new Set(["companies", "departments", "machines", "problems", "shifts"]);
+const SIMPLE_KEYS = new Set([
+  "companies",
+  "departments",
+  "machines",
+  "problems",
+  "transport-problems",
+  "shifts",
+]);
 
 export function createMasterService(pool) {
   const repo = createMasterRepository(pool);

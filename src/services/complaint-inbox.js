@@ -16,21 +16,66 @@ export const COMPLAINT_WORKFLOW_LABELS = {
   completed: "เสร็จสิ้น",
 };
 
+export const COMPLAINT_KIND_PRODUCT = "product";
+export const COMPLAINT_KIND_SERVICE_TRANSPORT = "service_transport";
+
+export const DOCUMENT_SCOPE_INTERNAL = "ภายใน";
+export const DOCUMENT_SCOPE_EXTERNAL = "ภายนอก";
+
+/** Normalize query kind; default product for existing Complaint menus. */
+export function normalizeComplaintKind(value) {
+  const kind = String(value || "").trim().toLowerCase();
+  if (kind === COMPLAINT_KIND_SERVICE_TRANSPORT) {
+    return COMPLAINT_KIND_SERVICE_TRANSPORT;
+  }
+  return COMPLAINT_KIND_PRODUCT;
+}
+
+/** Normalize ร้องเรียนภายใน / ร้องเรียนภายนอก (Excel sheet split). */
+export function normalizeDocumentScope(value) {
+  if (value == null || (typeof value === "string" && value.trim() === "")) return null;
+  const text = String(value).trim();
+  if (text === DOCUMENT_SCOPE_INTERNAL || text === DOCUMENT_SCOPE_EXTERNAL) return text;
+  return null;
+}
+
+/** SQL fragment: product rows include legacy NULL kind. */
+export function complaintKindSql(kind, column = "cr.complaint_kind") {
+  const normalized = normalizeComplaintKind(kind);
+  if (normalized === COMPLAINT_KIND_SERVICE_TRANSPORT) {
+    return {
+      sql: `${column} = 'service_transport'`,
+      params: [],
+    };
+  }
+  return {
+    sql: `(${column} = 'product' OR ${column} IS NULL)`,
+    params: [],
+  };
+}
+
 /**
  * Build WHERE for role-scoped complaint inbox (items waiting on this user).
  * Uses OR across CS / QA / department scopes when a user has multiple permissions.
+ * Optional documentScope filters service/transport by ภายใน vs ภายนอก.
  */
-export function buildComplaintInboxFilter(user) {
+export function buildComplaintInboxFilter(user, { kind, documentScope } = {}) {
+  const kindFilter = complaintKindSql(kind);
+  const scope = normalizeDocumentScope(documentScope);
+  const scopeSql = scope ? ` AND cr.document_scope = ?` : "";
+  const scopeParams = scope ? [scope] : [];
+  const kindPrefix = `${kindFilter.sql}${scopeSql}`;
+
   if (isCmsAdmin(user)) {
     return {
-      whereSql: `cr.workflow_status <> 'completed'`,
-      params: [],
+      whereSql: `${kindPrefix} AND cr.workflow_status <> 'completed'`,
+      params: [...kindFilter.params, ...scopeParams],
       empty: false,
     };
   }
 
   const parts = [];
-  const params = [];
+  const params = [...kindFilter.params, ...scopeParams];
 
   if (canCsWork(user)) {
     parts.push(`cr.workflow_status = 'cs_draft'`);
@@ -55,7 +100,7 @@ export function buildComplaintInboxFilter(user) {
   }
 
   return {
-    whereSql: `(${parts.join(" OR ")})`,
+    whereSql: `${kindPrefix} AND (${parts.join(" OR ")})`,
     params,
     empty: false,
   };

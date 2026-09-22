@@ -13,6 +13,8 @@ import { createRejectService } from "../services/rejects.js";
 import {
   buildComplaintInboxFilter,
   COMPLAINT_WORKFLOW_LABELS,
+  normalizeComplaintKind,
+  normalizeDocumentScope,
 } from "../services/complaint-inbox.js";
 import {
   buildActionPlanPdf,
@@ -32,6 +34,8 @@ import { config as appConfig } from "../core/config.js";
 import { logger } from "../core/logger.js";
 import { createFromErpService } from "../services/from-erp.js";
 import { canCsWork } from "../core/authz.js";
+import { lookupCustomerCare, customerCareStatus } from "../services/customer-care.js";
+import { resolveDateRange } from "../services/dashboard-period.js";
 
 const uploadsDirectory = resolve(
   fileURLToPath(new URL("../../storage/uploads/complaints/", import.meta.url)),
@@ -156,14 +160,16 @@ export function registerComplaintRoutes(app, { pool, wrap, requireAuth, telegram
     requireAuth,
     wrap(async (req, res) => {
       const actor = await resolveActor(req);
-      const filter = buildComplaintInboxFilter(actor);
+      const kind = normalizeComplaintKind(req.query.kind);
+      const documentScope = normalizeDocumentScope(req.query.document_scope);
+      const filter = buildComplaintInboxFilter(actor, { kind, documentScope });
       const total = filter.empty
         ? 0
         : await complaints.countInbox({
             whereSql: filter.whereSql,
             params: filter.params,
           });
-      res.json({ total });
+      res.json({ total, kind, document_scope: documentScope });
     }),
   );
 
@@ -172,7 +178,9 @@ export function registerComplaintRoutes(app, { pool, wrap, requireAuth, telegram
     requireAuth,
     wrap(async (req, res) => {
       const actor = await resolveActor(req);
-      const filter = buildComplaintInboxFilter(actor);
+      const kind = normalizeComplaintKind(req.query.kind);
+      const documentScope = normalizeDocumentScope(req.query.document_scope);
+      const filter = buildComplaintInboxFilter(actor, { kind, documentScope });
       const { page, pageSize, offset } = parsePagination({
         ...req.query,
         pageSize: Math.min(50, Number(req.query.pageSize) || 5),
@@ -203,6 +211,128 @@ export function registerComplaintRoutes(app, { pool, wrap, requireAuth, telegram
           { page, pageSize },
         ),
       );
+    }),
+  );
+
+  app.get(
+    "/api/customer-care/lookup",
+    requireAuth,
+    wrap(async (req, res) => {
+      const companyName = String(req.query.company_name || "").trim();
+      if (!companyName) {
+        const error = new Error("กรุณาระบุชื่อลูกค้า");
+        error.status = 400;
+        throw error;
+      }
+      const data = await lookupCustomerCare(companyName);
+      res.json({
+        data,
+        matched: Boolean(data),
+        status: customerCareStatus(),
+      });
+    }),
+  );
+
+  app.get(
+    "/api/complaints/service-transport/summary",
+    requireAuth,
+    wrap(async (req, res) => {
+      const documentScope = normalizeDocumentScope(req.query.document_scope);
+      const range = resolveDateRange(req.query);
+      const rows = await complaints.countByWorkflowKind(
+        "service_transport",
+        documentScope,
+        { from: range.from, to: range.to },
+      );
+      const byStatus = Object.fromEntries(
+        rows.map((row) => [row.workflow_status, row.total]),
+      );
+      const openTotal = rows
+        .filter((row) => row.workflow_status !== "completed")
+        .reduce((sum, row) => sum + row.total, 0);
+      res.json({
+        kind: "service_transport",
+        document_scope: documentScope,
+        period: range.period,
+        from: range.from,
+        to: range.to,
+        by_status: byStatus,
+        open_total: openTotal,
+        total: rows.reduce((sum, row) => sum + row.total, 0),
+        labels: COMPLAINT_WORKFLOW_LABELS,
+      });
+    }),
+  );
+
+  app.post(
+    "/api/complaints/service-transport",
+    requireAuth,
+    wrap(async (req, res) => {
+      const actor = await resolveActor(req);
+      if (!canCsWork(actor)) {
+        const error = new Error("ไม่มีสิทธิ์สร้าง Complaint (ต้องมี complaints.cs)");
+        error.status = 403;
+        throw error;
+      }
+      const documentScope = normalizeDocumentScope(req.body?.document_scope);
+      if (!documentScope) {
+        const error = new Error("กรุณาเลือกประเภทร้องเรียนภายใน หรือ ภายนอก");
+        error.status = 400;
+        throw error;
+      }
+      const licensePlate = String(req.body?.license_plate || "").trim() || null;
+      const subject = String(req.body?.subject || "").trim() || null;
+      const receivedDate = req.body?.received_date || null;
+      const companyName = String(req.body?.company_name || "").trim() || null;
+      if (!companyName) {
+        const error = new Error("กรุณาเลือกชื่อลูกค้า");
+        error.status = 400;
+        throw error;
+      }
+      const companyId = await complaints.resolveCompanyId(companyName);
+      if (!companyId) {
+        const error = new Error("ไม่พบชื่อลูกค้าใน Master — กรุณาเพิ่มที่หน้า Masters ก่อน");
+        error.status = 400;
+        throw error;
+      }
+      const care = await lookupCustomerCare(companyName);
+      const saleCsStaff =
+        care?.sale_cs_staff ||
+        (String(req.body?.sale_cs_staff || "").trim() || null);
+      const grade =
+        care?.grade || (String(req.body?.grade || "").trim() || null);
+      const insertId = await complaints.createServiceTransport({
+        licensePlate,
+        subject,
+        receivedDate,
+        documentScope,
+        companyId,
+        grade,
+        saleCsStaff,
+        createdBy: actor?.id || null,
+      });
+      if (activityLogs) {
+        await activityLogs.create({
+          userId: actor?.id || null,
+          username: actor?.username || null,
+          displayName: actor?.display_name || null,
+          department: actor?.department || null,
+          action: "create",
+          entityType: "complaint_record",
+          entityId: insertId,
+          summary: `สร้าง Complaint บริการ/ขนส่ง (${documentScope}) #${insertId}`,
+          changes: [
+            { field: "complaint_kind", label: "ประเภท", before: null, after: "service_transport" },
+            { field: "document_scope", label: "ร้องเรียนภายใน/ภายนอก", before: null, after: documentScope },
+            { field: "company_name", label: "ชื่อลูกค้า", before: null, after: companyName },
+            { field: "sale_cs_staff", label: "เจ้าหน้าที่ Sale/CS", before: null, after: saleCsStaff },
+            { field: "license_plate", label: "ทะเบียนรถ", before: null, after: licensePlate },
+            { field: "subject", label: "เรื่องที่ complaint", before: null, after: subject },
+          ],
+        });
+      }
+      const record = await withAttachments(await complaints.findById(insertId));
+      res.status(201).json({ data: record ? [record] : [], created: true });
     }),
   );
 
@@ -317,6 +447,11 @@ export function registerComplaintRoutes(app, { pool, wrap, requireAuth, telegram
             cs_remark: req.body?.cs_remark,
             received_date: req.body?.received_date,
             document_accepted: req.body?.document_accepted,
+            license_plate: req.body?.license_plate,
+            subject: req.body?.subject,
+            company_name: req.body?.company_name,
+            sale_cs_staff: req.body?.sale_cs_staff,
+            grade: req.body?.grade,
             action,
           },
           actor,
@@ -884,11 +1019,19 @@ export function registerComplaintRoutes(app, { pool, wrap, requireAuth, telegram
       const [flutes] = await pool.query(
         `SELECT id, name FROM flutes WHERE is_active = 1 ORDER BY name`,
       );
+      const [companies] = await pool.query(
+        `SELECT id, name, name_en FROM companies WHERE is_active = 1 ORDER BY name`,
+      );
+      const [transportProblems] = await pool.query(
+        `SELECT id, name FROM transport_problems WHERE is_active = 1 ORDER BY name`,
+      );
       formOptionsCache = {
         departments,
         problems,
         machines,
         flutes,
+        companies,
+        transport_problems: transportProblems,
         plan_signers: listPlanSigners(),
       };
       formOptionsCachedAt = now;
@@ -926,6 +1069,26 @@ export function registerComplaintRoutes(app, { pool, wrap, requireAuth, telegram
     wrap(async (_req, res) => {
       const documentNo = await complaints.getNextApDocumentNo();
       res.json({ data: { document_no: documentNo } });
+    }),
+  );
+
+  app.get(
+    "/api/complaints/:id",
+    requireAuth,
+    wrap(async (req, res) => {
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        const error = new Error("รหัสรายการไม่ถูกต้อง");
+        error.status = 400;
+        throw error;
+      }
+      const record = await complaints.findById(id);
+      if (!record) {
+        const error = new Error("ไม่พบรายการ");
+        error.status = 404;
+        throw error;
+      }
+      res.json({ data: await withAttachments(record) });
     }),
   );
 

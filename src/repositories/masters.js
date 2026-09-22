@@ -29,6 +29,11 @@ const MASTER_CONFIG = {
       "updated_at",
     ],
   },
+  "transport-problems": {
+    table: "transport_problems",
+    searchable: ["name"],
+    fields: ["id", "name", "is_active", "created_at", "updated_at"],
+  },
   shifts: {
     table: "shifts",
     searchable: ["name"],

@@ -127,6 +127,18 @@ export function loadConfig(env = process.env) {
       timeoutMs: Math.max(1000, Number(env.ERP_API_TIMEOUT_MS || 5000)),
       devFixture: env.NODE_ENV === "development" && env.ERP_DEV_FIXTURE === "1",
     }),
+    /** leefibre.customer_care — Sale/CS/grade by customer name (same source as ERP enrich). */
+    customerCare: Object.freeze({
+      enabled: env.CUSTOMER_CARE_ENABLED == null ? true : env.CUSTOMER_CARE_ENABLED === "1",
+      host: env.CUSTOMER_CARE_HOST || "",
+      port: Number(env.CUSTOMER_CARE_PORT || 3306),
+      user: env.CUSTOMER_CARE_USER || "",
+      password: env.CUSTOMER_CARE_PASSWORD || "",
+      database: env.CUSTOMER_CARE_DATABASE || "leefibre",
+      table: String(env.CUSTOMER_CARE_TABLE || "customer_care").replace(/[^a-zA-Z0-9_]/g, "") || "customer_care",
+      minScore: Number(env.CUSTOMER_CARE_MIN_SCORE || 0.82),
+      cacheTtlMs: Math.max(10_000, Number(env.CUSTOMER_CARE_CACHE_TTL_MS || 300_000)),
+    }),
   });
 }
 
