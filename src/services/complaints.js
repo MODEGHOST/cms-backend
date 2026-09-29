@@ -61,6 +61,7 @@ export const COMPLAINT_FIELD_META = {
     document_accepted: ["เอกสาร Action plan", TEXT],
     document_scope: ["เอกสารภายใน/ภายนอก", TEXT],
     document_no: ["เลขที่เอกสาร", TEXT],
+    shift: ["กะ", TEXT],
     license_plate: ["ทะเบียนรถ", TEXT],
     subject: ["เรื่องที่ complaint", TEXT],
     grade: ["Grade", TEXT],
@@ -158,6 +159,84 @@ function normalizeDocumentScope(value) {
   const text = String(value).trim();
   if (text === "ภายใน" || text === "ภายนอก") return text;
   return null;
+}
+
+function normalizeShift(value) {
+  if (value == null || (typeof value === "string" && value.trim() === "")) return null;
+  const text = String(value).trim().toUpperCase();
+  if (text === "A" || text === "B") return text;
+  return null;
+}
+
+/** QA แก้ข้อมูลที่ตัวเองกรอกได้ที่ขั้น QA Confirm โดยไม่เปลี่ยนสถานะ ถ้าไม่ได้สลับ O/P */
+async function applyQaOwnedFieldEdits(complaints, current, payload, updates, changes) {
+  const fieldMeta = COMPLAINT_FIELD_META.qa;
+  for (const [key, [label, type]] of Object.entries(fieldMeta)) {
+    if (key === "problem_name" || key === "company_name") continue;
+    if (!Object.prototype.hasOwnProperty.call(payload, key)) continue;
+    const before =
+      key === "document_accepted"
+        ? normalizeDocumentAccepted(current[key])
+        : key === "document_scope"
+          ? normalizeDocumentScope(current[key])
+          : key === "shift"
+            ? normalizeShift(current[key])
+            : normalize(type, current[key]);
+    const after =
+      key === "document_accepted"
+        ? normalizeDocumentAccepted(payload[key])
+        : key === "document_scope"
+          ? normalizeDocumentScope(payload[key])
+          : key === "shift"
+            ? normalizeShift(payload[key])
+            : normalize(type, payload[key]);
+    if (
+      key === "document_accepted" &&
+      payload[key] != null &&
+      String(payload[key]).trim() !== "" &&
+      after == null
+    ) {
+      const error = new Error("สถานะเอกสารต้องเป็น O หรือ P เท่านั้น");
+      error.status = 400;
+      throw error;
+    }
+    if (
+      key === "document_scope" &&
+      payload[key] != null &&
+      String(payload[key]).trim() !== "" &&
+      after == null
+    ) {
+      const error = new Error("เอกสารภายใน/ภายนอกต้องเป็น ภายใน หรือ ภายนอก เท่านั้น");
+      error.status = 400;
+      throw error;
+    }
+    if (key === "shift" && payload[key] != null && String(payload[key]).trim() !== "" && after == null) {
+      const error = new Error("กะต้องเป็น A หรือ B เท่านั้น");
+      error.status = 400;
+      throw error;
+    }
+    if (
+      key === "document_scope" &&
+      current.complaint_kind === "service_transport" &&
+      after == null &&
+      normalizeDocumentScope(current.document_scope)
+    ) {
+      continue;
+    }
+    if (before === after) continue;
+    changes.push({ field: key, label, before, after });
+    if (key === "reported_by_department_name") {
+      updates.reported_by_department_id = after
+        ? await complaints.resolveDepartmentId(after)
+        : null;
+    } else if (key === "responsible_department_name") {
+      updates.responsible_department_id = after
+        ? await complaints.resolveDepartmentId(after)
+        : null;
+    } else {
+      updates[key] = after;
+    }
+  }
 }
 
 function normalize(type, value) {
@@ -896,6 +975,48 @@ export function createComplaintService(complaints, activityLogs) {
           }
         }
 
+        await applyQaOwnedFieldEdits(complaints, current, payload, updates, changes);
+
+        const prevAccepted = normalizeDocumentAccepted(current.document_accepted);
+        const nextAccepted = Object.prototype.hasOwnProperty.call(updates, "document_accepted")
+          ? updates.document_accepted
+          : prevAccepted;
+        const responsibleName = Object.prototype.hasOwnProperty.call(
+          payload,
+          "responsible_department_name",
+        )
+          ? normalize(MASTER, payload.responsible_department_name)
+          : current.responsible_department_name;
+        const scopeValue = Object.prototype.hasOwnProperty.call(updates, "document_scope")
+          ? updates.document_scope
+          : current.document_scope;
+        const docNoValue = Object.prototype.hasOwnProperty.call(updates, "document_no")
+          ? updates.document_no
+          : current.document_no;
+        const readyForDepartment =
+          nextAccepted === "P" &&
+          Boolean(scopeValue) &&
+          Boolean(docNoValue) &&
+          canHandleDepartmentStep(responsibleName);
+        if (nextAccepted === "P" && prevAccepted !== "P") {
+          const nextStatus = readyForDepartment ? "pending_department" : "qa_review";
+          updates.workflow_status = nextStatus;
+          updates.document_accepted_at = new Date();
+          updates.document_deadline_warned_on = null;
+          if (nextStatus === "pending_department") {
+            updates.doc_forward_date = toLocalDateOnly(new Date());
+          }
+          changes.push({
+            field: "workflow_status",
+            label: "สถานะ",
+            before: status,
+            after: nextStatus,
+          });
+        } else if (nextAccepted === "O" && prevAccepted === "P") {
+          updates.document_accepted_at = null;
+          updates.document_deadline_warned_on = null;
+        }
+
         if (!isConfirm && changes.length === 0 && nextProblemIds == null) {
           return { record: current, changed: false, action: "save" };
         }
@@ -1021,13 +1142,17 @@ export function createComplaintService(complaints, activityLogs) {
             ? normalizeDocumentAccepted(current[key])
             : key === "document_scope"
               ? normalizeDocumentScope(current[key])
-              : normalize(type, current[key]);
+              : key === "shift"
+                ? normalizeShift(current[key])
+                : normalize(type, current[key]);
         const after =
           key === "document_accepted"
             ? normalizeDocumentAccepted(payload[key])
             : key === "document_scope"
               ? normalizeDocumentScope(payload[key])
-              : normalize(type, payload[key]);
+              : key === "shift"
+                ? normalizeShift(payload[key])
+                : normalize(type, payload[key]);
         if (key === "document_accepted" && payload[key] != null && String(payload[key]).trim() !== "" && after == null) {
           const error = new Error("สถานะเอกสารต้องเป็น O หรือ P เท่านั้น");
           error.status = 400;
@@ -1035,6 +1160,11 @@ export function createComplaintService(complaints, activityLogs) {
         }
         if (key === "document_scope" && payload[key] != null && String(payload[key]).trim() !== "" && after == null) {
           const error = new Error("เอกสารภายใน/ภายนอกต้องเป็น ภายใน หรือ ภายนอก เท่านั้น");
+          error.status = 400;
+          throw error;
+        }
+        if (key === "shift" && payload[key] != null && String(payload[key]).trim() !== "" && after == null) {
+          const error = new Error("กะต้องเป็น A หรือ B เท่านั้น");
           error.status = 400;
           throw error;
         }
@@ -1118,6 +1248,33 @@ export function createComplaintService(complaints, activityLogs) {
           }
         } else {
           updates[key] = after;
+        }
+      }
+
+      if (
+        config.group === "department" &&
+        (isQaUser(actor) || isCmsAdmin(actor)) &&
+        Object.prototype.hasOwnProperty.call(payload, "document_accepted")
+      ) {
+        const before = normalizeDocumentAccepted(current.document_accepted);
+        const after = normalizeDocumentAccepted(payload.document_accepted);
+        if (
+          payload.document_accepted != null &&
+          String(payload.document_accepted).trim() !== "" &&
+          after == null
+        ) {
+          const error = new Error("สถานะเอกสารต้องเป็น O หรือ P เท่านั้น");
+          error.status = 400;
+          throw error;
+        }
+        if (before !== after) {
+          updates.document_accepted = after;
+          changes.push({
+            field: "document_accepted",
+            label: "เอกสาร Action plan",
+            before,
+            after,
+          });
         }
       }
 
@@ -1290,6 +1447,21 @@ export function createComplaintService(complaints, activityLogs) {
       } else if (nextAccepted === "O" && prevAccepted === "P") {
         updates.document_accepted_at = null;
         updates.document_deadline_warned_on = null;
+      }
+
+      if (
+        !updates.workflow_status &&
+        !isSubmit &&
+        nextAccepted === "O" &&
+        (status === "pending_department" || status === "department_action")
+      ) {
+        updates.workflow_status = "qa_confirm";
+        changes.push({
+          field: "workflow_status",
+          label: "สถานะ",
+          before: status,
+          after: "qa_confirm",
+        });
       }
 
       if (!Object.keys(updates).length) {

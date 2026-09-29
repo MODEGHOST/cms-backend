@@ -1,4 +1,7 @@
 import { parseIdList, parseStringList, resolveRateWindows } from "./dashboard-period.js";
+import { createTtlCache } from "../utils/ttl-cache.js";
+
+const orderRateCache = createTtlCache({ ttlMs: 60_000, maxEntries: 64 });
 
 /** ตัวหารแถวรวม — ครบตามที่ดึงจาก ERP */
 const ORDER_TYPES = [
@@ -212,6 +215,10 @@ export function createOrderRateService(pool) {
   }
 
   async function buildComparison({ kind, table, alias, dateColumn, query = {} }) {
+    const cacheKey = `order-rate:${kind}:${JSON.stringify(query || {})}`;
+    const cached = orderRateCache.get(cacheKey);
+    if (cached != null) return cached;
+
     const windows = resolveRateWindows();
     const ranges = uniqueRanges(windows);
     const caseFilter = buildCaseFilter(kind, alias, query);
@@ -228,7 +235,7 @@ export function createOrderRateService(pool) {
       lastSyncedAt(),
     ]);
 
-    return {
+    return orderRateCache.set(cacheKey, {
       kind,
       source: "order_daily_count",
       date_column: dateColumn,
@@ -280,7 +287,7 @@ export function createOrderRateService(pool) {
           status: statusForSplit(latest?.rate_pct, baselinePeriod?.rate_pct),
         };
       }),
-    };
+    });
   }
 
   return {

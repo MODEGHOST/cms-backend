@@ -21,7 +21,7 @@ import { createTtlCache } from "../utils/ttl-cache.js";
 import { enrichProblemRow, mapFocusProblems } from "../utils/problem-image.js";
 
 /** Short TTL — identical query params return the same payload (no SQL rewrite). */
-const dashboardPayloadCache = createTtlCache({ ttlMs: 60_000, maxEntries: 64 });
+const dashboardPayloadCache = createTtlCache({ ttlMs: 60_000, maxEntries: 128 });
 
 /** Bucket absorbing series outside the top-N of a stacked trend. */
 const OTHER_SERIES_LABEL = "อื่นๆ";
@@ -35,6 +35,9 @@ export const WORKFLOW_LABELS = {
   qa_confirm: "QA ยืนยันผล",
   completed: "ปิดเคสแล้ว",
 };
+
+/** CS saved or submitted, but QA has not pressed รับเรื่อง yet. */
+const HIDDEN_UNTIL_QA_ACCEPT = ["cs_draft", "pending_qa"];
 
 /** How many periods the comparison table may show, per grain. */
 const SUMMARY_BUCKETS = {
@@ -120,7 +123,6 @@ export function createComplaintDashboardService(pool) {
     shifts = [],
     grades = [],
     statuses = [],
-    includeDrafts = false,
   }) {
     const clauses = [
       "cr.received_date IS NOT NULL",
@@ -143,8 +145,11 @@ export function createComplaintDashboardService(pool) {
     addIn("shift", shifts);
     addIn("grade", grades);
     addIn("workflow_status", statuses);
-    if (!statuses.length && !includeDrafts) {
-      clauses.push("cr.workflow_status <> 'cs_draft'");
+    if (!statuses.length) {
+      clauses.push(
+        `cr.workflow_status NOT IN (${HIDDEN_UNTIL_QA_ACCEPT.map(() => "?").join(", ")})`,
+      );
+      params.push(...HIDDEN_UNTIL_QA_ACCEPT);
     }
 
     return { clauses, params };
@@ -218,7 +223,8 @@ export function createComplaintDashboardService(pool) {
       `SELECT MIN(received_date) AS min_date, MAX(received_date) AS max_date
        FROM complaint_records
        WHERE received_date IS NOT NULL
-         AND (complaint_kind = 'product' OR complaint_kind IS NULL)`,
+         AND (complaint_kind = 'product' OR complaint_kind IS NULL)
+         AND workflow_status NOT IN ('cs_draft', 'pending_qa')`,
     );
     return {
       period: "all",
@@ -309,11 +315,6 @@ export function createComplaintDashboardService(pool) {
       const range = await resolveEffectiveRange(query);
       const filters = resolveFilters(query);
       const { whereSql, params } = buildWhere({ ...range, ...filters });
-      const { whereSql: statusWhereSql, params: statusParams } = buildWhere({
-        ...range,
-        ...filters,
-        includeDrafts: true,
-      });
       const previous = headlineCompareRange(range);
       const prevFilter = previous
         ? buildWhere({ ...previous, ...filters })
@@ -381,9 +382,9 @@ export function createComplaintDashboardService(pool) {
         q(
           `SELECT cr.workflow_status AS status, COUNT(*) AS count
            FROM complaint_records cr
-           ${statusWhereSql}
+           ${whereSql}
            GROUP BY cr.workflow_status`,
-          statusParams,
+          params,
         ),
         q(
           `SELECT ranked.department_id, ranked.department_name,
@@ -596,6 +597,10 @@ export function createComplaintDashboardService(pool) {
      * per month / week / day bucket, plus a trend verdict on the latest bucket.
      */
     async getSummaryTable(query = {}) {
+      const cacheKey = `complaint-summary-table:${JSON.stringify(query || {})}`;
+      const cached = dashboardPayloadCache.get(cacheKey);
+      if (cached != null) return cached;
+
       const dimensionKey = String(query.dimension || "department").toLowerCase();
       const dimension = DIMENSIONS[dimensionKey];
       if (!dimension) {
@@ -764,7 +769,7 @@ export function createComplaintDashboardService(pool) {
         periodTotals,
       );
 
-      return {
+      return dashboardPayloadCache.set(cacheKey, {
         dimension: dimensionKey,
         dimension_label: dimension.label,
         grain,
@@ -779,7 +784,7 @@ export function createComplaintDashboardService(pool) {
         periods,
         rows: resultRows,
         totals: { ...totals, key: "totals", grand_total: grandTotal },
-      };
+      });
     },
 
     async getKpiDetail(query = {}) {

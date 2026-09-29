@@ -20,7 +20,7 @@ import { createTtlCache } from "../utils/ttl-cache.js";
 import { enrichProblemRow, mapFocusProblems } from "../utils/problem-image.js";
 
 /** Short TTL — identical query params return the same payload (no SQL rewrite). */
-const dashboardPayloadCache = createTtlCache({ ttlMs: 60_000, maxEntries: 64 });
+const dashboardPayloadCache = createTtlCache({ ttlMs: 60_000, maxEntries: 128 });
 
 /** Column that absorbs rejects with no machine, or a machine removed from Master. */
 const MACHINE_OTHER_KEY = "machine_other";
@@ -1098,6 +1098,10 @@ export function createDashboardService(pool) {
      * machine (BHS / YUELI / ISOWA / …) holding sheets, value and weight.
      */
     async getMachineComparison(query = {}) {
+      const cacheKey = `reject-machine-comparison:${JSON.stringify(query || {})}`;
+      const cached = dashboardPayloadCache.get(cacheKey);
+      if (cached != null) return cached;
+
       const range = await resolveEffectiveRange(query);
       const grain = comparisonGrain(query, range);
       const buckets = resolveMachineComparisonBuckets(query.periods, grain);
@@ -1226,7 +1230,7 @@ export function createDashboardService(pool) {
         addCell(totals.total, row.total);
       }
 
-      return {
+      return dashboardPayloadCache.set(cacheKey, {
         grain,
         periods_count: buckets.count,
         periods_options: buckets.options,
@@ -1242,7 +1246,7 @@ export function createDashboardService(pool) {
         machines: columns,
         rows: resultRows,
         totals,
-      };
+      });
     },
 
     async getRejectDayDetail(query = {}) {
@@ -1255,6 +1259,10 @@ export function createDashboardService(pool) {
      * verdict on the latest bucket (ดีขึ้น / ทรงตัว / ต้องปรับปรุง).
      */
     async getSummaryTable(query = {}) {
+      const cacheKey = `reject-summary-table:${JSON.stringify(query || {})}`;
+      const cached = dashboardPayloadCache.get(cacheKey);
+      if (cached != null) return cached;
+
       const dimensionKey = String(query.dimension || "department").toLowerCase();
       const dimension = REJECT_SUMMARY_DIMENSIONS[dimensionKey];
       if (!dimension) {
@@ -1474,7 +1482,7 @@ export function createDashboardService(pool) {
         periodTotals,
       );
 
-      return {
+      return dashboardPayloadCache.set(cacheKey, {
         dimension: dimensionKey,
         dimension_label: dimension.label,
         grain,
@@ -1489,7 +1497,7 @@ export function createDashboardService(pool) {
         periods,
         rows: resultRows,
         totals: { ...totals, key: "totals", grand_total: grandTotal },
-      };
+      });
     },
 
     async getKpiDetail(query = {}) {
